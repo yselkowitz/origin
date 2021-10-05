@@ -4,6 +4,7 @@ package extended
 
 import (
 	// openshift/kubernetes defines the set of kube tests that should be included
+
 	_ "k8s.io/kubernetes/openshift-hack/e2e"
 
 	_ "github.com/openshift/origin/test/extended/apiserver"
@@ -17,6 +18,7 @@ import (
 	_ "github.com/openshift/origin/test/extended/cluster"
 	_ "github.com/openshift/origin/test/extended/cmd"
 	_ "github.com/openshift/origin/test/extended/controller_manager"
+	_ "github.com/openshift/origin/test/extended/coreos"
 	_ "github.com/openshift/origin/test/extended/crdvalidation"
 	_ "github.com/openshift/origin/test/extended/csrapprover"
 	_ "github.com/openshift/origin/test/extended/deployments"

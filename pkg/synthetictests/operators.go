@@ -5,19 +5,39 @@ import (
 	"strings"
 	"time"
 
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/origin/pkg/monitor"
 	"github.com/openshift/origin/pkg/test/ginkgo"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-func testOperatorStateTransitions(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testStableSystemOperatorStateTransitions(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
+	return testOperatorStateTransitions(events, []configv1.ClusterStatusConditionType{configv1.OperatorAvailable, configv1.OperatorDegraded})
+}
+
+func testUpgradeOperatorStateTransitions(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
+	return testOperatorStateTransitions(events, []configv1.ClusterStatusConditionType{configv1.OperatorAvailable, configv1.OperatorDegraded})
+}
+func testOperatorStateTransitions(events monitorapi.Intervals, conditionTypes []configv1.ClusterStatusConditionType) []*ginkgo.JUnitTestCase {
 	ret := []*ginkgo.JUnitTestCase{}
+
+	var start, stop time.Time
+	for _, event := range events {
+		if start.IsZero() || event.From.Before(start) {
+			start = event.From
+		}
+		if stop.IsZero() || event.To.After(stop) {
+			stop = event.To
+		}
+	}
+	duration := stop.Sub(start).Seconds()
 
 	knownOperators := allOperators(events)
 	eventsByOperator := getEventsByOperator(events)
-	e2eEvents := monitor.E2ETestEvents(events)
-	for _, condition := range []configv1.ClusterStatusConditionType{configv1.OperatorAvailable, configv1.OperatorDegraded, configv1.OperatorProgressing} {
+	e2eEventIntervals := monitor.E2ETestEventIntervals(events)
+	for _, condition := range conditionTypes {
 		for _, operatorName := range knownOperators.List() {
 			bzComponent := GetBugzillaComponentForOperator(operatorName)
 			if bzComponent == "Unknown" {
@@ -26,14 +46,18 @@ func testOperatorStateTransitions(events []*monitor.EventInterval) []*ginkgo.JUn
 			testName := fmt.Sprintf("[bz-%v] clusteroperator/%v should not change condition/%v", bzComponent, operatorName, condition)
 			operatorEvents := eventsByOperator[operatorName]
 			if len(operatorEvents) == 0 {
-				ret = append(ret, &ginkgo.JUnitTestCase{Name: testName})
+				ret = append(ret, &ginkgo.JUnitTestCase{
+					Name:     testName,
+					Duration: duration,
+				})
 				continue
 			}
 
-			failures := testOperatorState(condition, operatorEvents, e2eEvents)
+			failures := testOperatorState(condition, operatorEvents, e2eEventIntervals)
 			if len(failures) > 0 {
 				ret = append(ret, &ginkgo.JUnitTestCase{
 					Name:      testName,
+					Duration:  duration,
 					SystemOut: strings.Join(failures, "\n"),
 					FailureOutput: &ginkgo.FailureOutput{
 						Output: fmt.Sprintf("%d unexpected clusteroperator state transitions during e2e test run \n\n%v", len(failures), strings.Join(failures, "\n")),
@@ -48,14 +72,14 @@ func testOperatorStateTransitions(events []*monitor.EventInterval) []*ginkgo.JUn
 	return ret
 }
 
-func allOperators(events []*monitor.EventInterval) sets.String {
+func allOperators(events monitorapi.Intervals) sets.String {
 	// start with a list of known values
 	knownOperators := sets.NewString(KnownOperators.List()...)
 
 	// now add all the operators we see in the events.
 	for _, event := range events {
-		operatorName := operatorFromLocator(event.Locator)
-		if len(operatorName) == 0 {
+		operatorName, ok := monitorapi.OperatorFromLocator(event.Locator)
+		if !ok {
 			continue
 		}
 		knownOperators.Insert(operatorName)
@@ -64,70 +88,49 @@ func allOperators(events []*monitor.EventInterval) sets.String {
 }
 
 // getEventsByOperator returns map keyed by operator locator with all events associated with it.
-func getEventsByOperator(events []*monitor.EventInterval) map[string][]*monitor.EventInterval {
-	eventsByClusterOperator := map[string][]*monitor.EventInterval{}
+func getEventsByOperator(events monitorapi.Intervals) map[string]monitorapi.Intervals {
+	eventsByClusterOperator := map[string]monitorapi.Intervals{}
 	for _, event := range events {
-		if !strings.Contains(event.Locator, "clusteroperator/") {
+		operatorName, ok := monitorapi.OperatorFromLocator(event.Locator)
+		if !ok {
 			continue
 		}
-		operators := strings.Split(event.Locator, "/")
-		operatorName := operators[1]
 		eventsByClusterOperator[operatorName] = append(eventsByClusterOperator[operatorName], event)
 	}
 	return eventsByClusterOperator
 }
 
-func testOperatorState(interestingCondition configv1.ClusterStatusConditionType, events []*monitor.EventInterval, e2eEvents []*monitor.EventInterval) []string {
+func testOperatorState(interestingCondition configv1.ClusterStatusConditionType, eventIntervals monitorapi.Intervals, e2eEventIntervals monitorapi.Intervals) []string {
 	failures := []string{}
 
-	clusterOperatorToEvents := getEventsByOperator(events)
+	for _, eventInterval := range eventIntervals {
+		// ignore non-interval eventInterval intervals
+		if eventInterval.From == eventInterval.To {
+			continue
+		}
+		if !strings.Contains(eventInterval.Message, fmt.Sprintf("%v", interestingCondition)) {
+			continue
+		}
 
-	var previousEvent *monitor.EventInterval
+		// if there was any switch, it was wrong/unexpected at some point
+		failures = append(failures, fmt.Sprintf("%v", eventInterval))
 
-	for clusterOperator, events := range clusterOperatorToEvents {
-		for _, event := range events {
-			condition := monitor.GetOperatorConditionStatus(event.Message)
-			if condition == nil || condition.Type != interestingCondition {
+		overlappingE2EIntervals := monitor.FindOverlap(e2eEventIntervals, eventInterval.From, eventInterval.From)
+		concurrentE2E := []string{}
+		for _, overlap := range overlappingE2EIntervals {
+			if overlap.Level == monitorapi.Info {
 				continue
 			}
-			// if there was any switch, it was wrong/unexpected at some point
-			failures = append(failures, fmt.Sprintf("%v became %v=%v at %v -- reason/%v: %v", clusterOperator, condition.Type, condition.Status, event.From, condition.Reason, condition.Message))
-
-			if !isTransitionToGoodOperatorState(condition) {
-				// we don't see a lot of these as end states, don't bother trying to find the tests that were running during this time.
+			e2eTest, ok := monitorapi.E2ETestFromLocator(overlap.Locator)
+			if !ok {
 				continue
 			}
+			concurrentE2E = append(concurrentE2E, fmt.Sprintf("%v", e2eTest))
+		}
 
-			startTime := time.Now().Add(4 * time.Hour)
-			if previousEvent != nil {
-				startTime = previousEvent.InitiatedAt
-			}
-			failedTests := monitor.FindFailedTestsActiveBetween(e2eEvents, startTime, event.InitiatedAt)
-			if len(failedTests) > 0 {
-				failures = append(failures, fmt.Sprintf("%d tests failed during this blip (%v to %v): %v", len(failedTests), startTime, event.InitiatedAt, strings.Join(failedTests, ",")))
-			}
+		if len(concurrentE2E) > 0 {
+			failures = append(failures, fmt.Sprintf("%d tests failed during this blip (%v to %v): %v", len(concurrentE2E), eventInterval.From, eventInterval.From, strings.Join(concurrentE2E, "\n")))
 		}
 	}
 	return failures
-}
-
-func operatorFromLocator(locator string) string {
-	if !strings.Contains(locator, "clusteroperator/") {
-		return ""
-	}
-	operators := strings.Split(locator, "/")
-	return operators[1]
-}
-
-func isTransitionToGoodOperatorState(condition *configv1.ClusterOperatorStatusCondition) bool {
-	switch condition.Type {
-	case configv1.OperatorAvailable:
-		return condition.Status == configv1.ConditionTrue
-	case configv1.OperatorDegraded:
-		return condition.Status == configv1.ConditionFalse
-	case configv1.OperatorProgressing:
-		return condition.Status == configv1.ConditionFalse
-	default:
-		return false
-	}
 }

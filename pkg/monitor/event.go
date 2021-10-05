@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
+
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -14,7 +17,7 @@ import (
 )
 
 func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Interface) {
-	reMatchFirstQuote := regexp.MustCompile(`"([^"]+)"`)
+	reMatchFirstQuote := regexp.MustCompile(`"([^"]+)"( in (\d+(\.\d+)?(s|ms)$))?`)
 
 	go func() {
 		for {
@@ -23,11 +26,20 @@ func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Int
 				return
 			default:
 			}
+
+			// filter out events written "now" but with significantly older start times (events
+			// created in test jobs are the most common)
+			significantlyBeforeNow := time.Now().UTC().Add(-15 * time.Minute)
+
 			events, err := client.CoreV1().Events("").List(ctx, metav1.ListOptions{Limit: 1})
 			if err != nil {
 				continue
 			}
 			rv := events.ResourceVersion
+
+			for i := range events.Items {
+				m.RecordResource("events", &events.Items[i])
+			}
 
 			for expired := false; !expired; {
 				w, err := client.CoreV1().Events("").Watch(ctx, metav1.ListOptions{ResourceVersion: rv})
@@ -52,10 +64,30 @@ func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Int
 							if !ok {
 								continue
 							}
+							m.RecordResource("events", obj)
+
+							t := obj.LastTimestamp.Time
+							if t.IsZero() {
+								t = obj.EventTime.Time
+							}
+							if t.IsZero() {
+								t = obj.CreationTimestamp.Time
+							}
+							if t.Before(significantlyBeforeNow) {
+								break
+							}
+
 							message := obj.Message
 							if obj.Count > 1 {
 								message += fmt.Sprintf(" (%d times)", obj.Count)
 							}
+
+							if obj.InvolvedObject.Kind == "Node" {
+								if node, err := client.CoreV1().Nodes().Get(ctx, obj.InvolvedObject.Name, metav1.GetOptions{}); err == nil {
+									message = fmt.Sprintf("roles/%s %s", nodeRoles(node), message)
+								}
+							}
+
 							// special case some very common events
 							switch obj.Reason {
 							case "":
@@ -82,6 +114,12 @@ func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Int
 								if obj.InvolvedObject.Kind == "Pod" {
 									if containerName, ok := eventForContainer(obj.InvolvedObject.FieldPath); ok {
 										if m := reMatchFirstQuote.FindStringSubmatch(obj.Message); m != nil {
+											if len(m) > 3 {
+												if d, err := time.ParseDuration(m[3]); err == nil {
+													message = fmt.Sprintf("container/%s reason/%s duration/%.3fs image/%s", containerName, obj.Reason, d.Seconds(), m[1])
+													break
+												}
+											}
 											message = fmt.Sprintf("container/%s reason/%s image/%s", containerName, obj.Reason, m[1])
 											break
 										}
@@ -91,15 +129,15 @@ func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Int
 							default:
 								message = fmt.Sprintf("reason/%s %s", obj.Reason, message)
 							}
-							condition := Condition{
-								Level:   Info,
+							condition := monitorapi.Condition{
+								Level:   monitorapi.Info,
 								Locator: locateEvent(obj),
 								Message: message,
 							}
 							if obj.Type == corev1.EventTypeWarning {
-								condition.Level = Warning
+								condition.Level = monitorapi.Warning
 							}
-							m.Record(condition)
+							m.RecordAt(t, condition)
 						case watch.Error:
 							var message string
 							if status, ok := event.Object.(*metav1.Status); ok {
@@ -111,8 +149,8 @@ func startEventMonitoring(ctx context.Context, m Recorder, client kubernetes.Int
 							} else {
 								message = fmt.Sprintf("event object was not a Status: %T", event.Object)
 							}
-							m.Record(Condition{
-								Level:   Info,
+							m.Record(monitorapi.Condition{
+								Level:   monitorapi.Info,
 								Locator: "kube-apiserver",
 								Message: fmt.Sprintf("received an error while watching events: %s", message),
 							})

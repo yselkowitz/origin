@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,7 +17,6 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	e2e "k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/framework/pod"
 	e2epv "k8s.io/kubernetes/test/e2e/framework/pv"
 
@@ -380,30 +378,36 @@ var _ = g.Describe("[sig-devex][Feature:Jenkins][Slow] Jenkins repos e2e openshi
 					if err != nil || !br.BuildSuccess {
 						exutil.DumpBuilds(oc)
 						exutil.DumpPodLogsStartingWith("nodejs", oc)
-						exutil.DumpBuildLogs("nodejs-mongodb-example", oc)
-						exutil.DumpDeploymentLogs("mongodb", 1, oc)
-						exutil.DumpDeploymentLogs("nodejs-mongodb-example", 1, oc)
+						exutil.DumpBuildLogs("nodejs-postgresql-example", oc)
+						exutil.DumpDeploymentLogs("postgresql", 1, oc)
+						exutil.DumpDeploymentLogs("nodejs-postgresql-example", 1, oc)
 					}
 					debugAnyJenkinsFailure(br, oc.Namespace()+"-nodejs-sample-pipeline", oc, true)
 					br.AssertSuccess()
 
 					// wait for the service to be running
-					g.By("expecting the nodejs-mongodb-example service to be deployed and running")
-					_, err = exutil.GetEndpointAddress(oc, "nodejs-mongodb-example")
+					g.By("expecting the nodejs-postgresql-example service to be deployed and running")
+					_, err = exutil.GetEndpointAddress(oc, "nodejs-postgresql-example")
 					o.Expect(err).NotTo(o.HaveOccurred())
 
 					g.By("clean up openshift resources for next potential run")
-					err = oc.Run("delete").Args("all", "-l", "app=nodejs-mongodb-example").Execute()
+					err = oc.Run("delete").Args("dc,svc", "postgresql").Execute()
 					o.Expect(err).NotTo(o.HaveOccurred())
-					err = oc.Run("delete").Args("secret", "nodejs-mongodb-example").Execute()
+					err = oc.Run("delete").Args("dc,bc,is,svc,secret,route", "nodejs-postgresql-example").Execute()
 					o.Expect(err).NotTo(o.HaveOccurred())
 					err = oc.Run("delete").Args("bc", "nodejs-sample-pipeline").Execute()
 					o.Expect(err).NotTo(o.HaveOccurred())
-					err = oc.Run("delete").Args("is", "nodejs-mongodb-example-staging").Execute()
+					err = oc.Run("delete").Args("is", "nodejs-postgresql-example-staging").Execute()
 					o.Expect(err).NotTo(o.HaveOccurred())
 				})
 
-				g.By("Pipeline with env vars and git repo source")
+				/* this test does not work reliably because the git repo created locally is not in the same container/pod
+				that Jenkins is running in.  It becomes a timing window of what the sync plugin updates when for BCs during
+				error scenarios.
+
+				We want to a) move the git repo / Jenkinsfile refereneced to a repo on https://github.com/openshift
+				g.By("Pipeline with env vars and git repo source"), b) include this in our initial list of tests we
+				want to move out of openshift/origin and into the openshift/jenkins* repos
 
 				g.By("should propagate env vars to bc", func() {
 					g.By(fmt.Sprintf("creating git repo %v", envVarsPipelineGitRepoBuildConfig))
@@ -435,7 +439,7 @@ var _ = g.Describe("[sig-devex][Feature:Jenkins][Slow] Jenkins repos e2e openshi
 					o.Expect(len(envs)).To(o.Equal(1))
 					o.Expect(envs[0].Name).To(o.Equal("FOO1"))
 					o.Expect(envs[0].Value).To(o.Equal("BAR1"))
-				})
+				})*/
 
 				g.By("Blue-green pipeline")
 
@@ -556,18 +560,29 @@ var _ = g.Describe("[sig-devex][Feature:Jenkins][Slow] Jenkins repos e2e openshi
 						o.Expect(err).NotTo(o.HaveOccurred())
 
 						g.By(fmt.Sprintf("verifying that the main route has been switched to %s", newColour))
-						value, err := oc.Run("get").Args("route", "nodejs-mongodb-example", "-o", "jsonpath={ .spec.to.name }").Output()
+						value, err := oc.Run("get").Args("route", "nodejs-postgresql-example", "-o", "jsonpath={ .spec.to.name }").Output()
 						o.Expect(err).NotTo(o.HaveOccurred())
 						activeRoute := strings.TrimSpace(value)
-						g.By(fmt.Sprintf("verifying that the active route is 'nodejs-mongodb-example-%s'", newColour))
-						o.Expect(activeRoute).To(o.Equal(fmt.Sprintf("nodejs-mongodb-example-%s", newColour)))
+						g.By(fmt.Sprintf("verifying that the active route is 'nodejs-postgresql-example-%s'", newColour))
+						o.Expect(activeRoute).To(o.Equal(fmt.Sprintf("nodejs-postgresql-example-%s", newColour)))
 					}
 
 					buildAndSwitch("green")
 					buildAndSwitch("blue")
 
 					g.By("clean up openshift resources for next potential run")
-					err = oc.Run("delete").Args("all", "-l", "app=bluegreen-pipeline").Execute()
+
+					err = oc.Run("delete").Args("bc", "bluegreen-pipeline").Execute()
+					o.Expect(err).NotTo(o.HaveOccurred())
+					err = oc.Run("delete").Args("dc,svc", "postgresql").Execute()
+					o.Expect(err).NotTo(o.HaveOccurred())
+					err = oc.Run("delete").Args("bc,is,secret,route", "nodejs-postgresql-example").Execute()
+					o.Expect(err).NotTo(o.HaveOccurred())
+					err = oc.Run("delete").Args("dc,svc", "nodejs-postgresql-example-green").Execute()
+					o.Expect(err).NotTo(o.HaveOccurred())
+					err = oc.Run("delete").Args("dc,svc", "nodejs-postgresql-example-blue").Execute()
+					o.Expect(err).NotTo(o.HaveOccurred())
+					err = oc.Run("delete").Args("route", "green-nodejs-postgresql-example", "blue-nodejs-postgresql-example").Execute()
 					o.Expect(err).NotTo(o.HaveOccurred())
 				})
 

@@ -35,7 +35,7 @@ const (
 var _ = ginkgo.Describe("[sig-network] Internal connectivity", func() {
 	f := framework.NewDefaultFramework("k8s-nettest")
 
-	ginkgo.It("for TCP and UDP on ports 9000-9999 is allowed", func() {
+	ginkgo.It("for TCP and UDP on ports 9000-9999 is allowed [Serial:Self]", func() {
 		e2eskipper.SkipUnlessNodeCountIsAtLeast(2)
 		clientConfig := f.ClientConfig()
 
@@ -71,7 +71,7 @@ var _ = ginkgo.Describe("[sig-network] Internal connectivity", func() {
 							{
 								Name:    "webserver",
 								Image:   e2enetwork.NetexecImageName,
-								Command: []string{"/bin/bash", "-c", fmt.Sprintf("#!/bin/bash\napk add -q --update tcpdump\n./agnhost netexec --http-port=%v --udp-port=%v &\nexec tcpdump -i any port %v or port %v -n", nodeTCPPort, nodeUDPPort, nodeTCPPort, nodeUDPPort)},
+								Command: []string{"/agnhost", "netexec", fmt.Sprintf("--http-port=%v", nodeTCPPort), fmt.Sprintf("--udp-port=%v", nodeUDPPort)},
 								Ports: []v1.ContainerPort{
 									{Name: "tcp", ContainerPort: nodeTCPPort},
 									{Name: "udp", ContainerPort: nodeUDPPort},

@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/blang/semver"
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 
@@ -37,6 +38,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	batchv1client "k8s.io/client-go/kubernetes/typed/batch/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/rest"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 	e2epod "k8s.io/kubernetes/test/e2e/framework/pod"
 	"k8s.io/kubernetes/test/e2e/framework/statefulset"
@@ -48,6 +50,7 @@ import (
 	operatorv1 "github.com/openshift/api/operator/v1"
 	securityv1 "github.com/openshift/api/security/v1"
 	buildv1clienttyped "github.com/openshift/client-go/build/clientset/versioned/typed/build/v1"
+	configv1client "github.com/openshift/client-go/config/clientset/versioned"
 	imagev1typedclient "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
 	projectv1typedclient "github.com/openshift/client-go/project/clientset/versioned/typed/project/v1"
 	"github.com/openshift/library-go/pkg/build/naming"
@@ -239,7 +242,7 @@ func WaitForOpenShiftNamespaceImageStreams(oc *CLI) error {
 	if err != nil {
 		return err
 	}
-	langs := []string{"ruby", "nodejs", "perl", "php", "python", "mysql", "postgresql", "mongodb", "jenkins"}
+	langs := []string{"ruby", "nodejs", "perl", "php", "python", "mysql", "postgresql", "jenkins"}
 	scan := func() error {
 		// check the samples operator to see about imagestream import status
 		samplesOperatorConfig, err := oc.AdminConfigClient().ConfigV1().ClusterOperators().Get(ctx, "openshift-samples", metav1.GetOptions{})
@@ -984,13 +987,23 @@ func WaitForServiceAccount(c corev1client.ServiceAccountInterface, name string) 
 			return false, fmt.Errorf("Failed to get service account %q: %v", name, err)
 		}
 		secretNames := []string{}
+		var hasDockercfg, hasToken bool
 		for _, s := range sc.Secrets {
-			if strings.Contains(s.Name, "dockercfg") {
-				return true, nil
+			if strings.Contains(s.Name, "-token-") {
+				hasToken = true
 			}
 			secretNames = append(secretNames, s.Name)
 		}
-		e2e.Logf("Waiting for service account %q secrets (%s) to include dockercfg ...", name, strings.Join(secretNames, ","))
+		for _, s := range sc.ImagePullSecrets {
+			if strings.Contains(s.Name, "-dockercfg-") {
+				hasDockercfg = true
+			}
+			secretNames = append(secretNames, s.Name)
+		}
+		if hasDockercfg && hasToken {
+			return true, nil
+		}
+		e2e.Logf("Waiting for service account %q secrets (%s) to include dockercfg/token ...", name, strings.Join(secretNames, ","))
 		return false, nil
 	}
 	return wait.Poll(100*time.Millisecond, 3*time.Minute, waitFn)
@@ -1921,4 +1934,36 @@ func IsClusterOperated(oc *CLI) bool {
 		return false
 	}
 	return true
+}
+
+// AllClusterVersionsAreGTE returns true if all historical versions on the cluster version are
+// at or newer than the provided semver, ignoring prerelease status. If no versions are found
+// an error is returned.
+func AllClusterVersionsAreGTE(version semver.Version, config *rest.Config) (bool, error) {
+	c, err := configv1client.NewForConfig(config)
+	if err != nil {
+		return false, err
+	}
+	cv, err := c.ConfigV1().ClusterVersions().Get(context.TODO(), "version", metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	if len(cv.Status.History) == 0 {
+		return false, fmt.Errorf("no versions in cluster version history")
+	}
+	for _, v := range cv.Status.History {
+		ver, err := semver.Parse(v.Version)
+		if err != nil {
+			return false, err
+		}
+
+		// ignore prerelease version matching here
+		ver.Pre = nil
+		ver.Build = nil
+
+		if ver.LT(version) {
+			return false, nil
+		}
+	}
+	return true, nil
 }

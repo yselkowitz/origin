@@ -10,8 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"k8s.io/client-go/transport"
-
+	configclientset "github.com/openshift/client-go/config/clientset/versioned"
+	"github.com/openshift/origin/pkg/monitor/intervalcreation"
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -20,8 +21,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/clientcmd"
-
-	configclientset "github.com/openshift/client-go/config/clientset/versioned"
+	"k8s.io/client-go/transport"
 )
 
 const (
@@ -33,46 +33,61 @@ const (
 	LocatorOAuthAPIServerReusedConnection     = "oauth-apiserver-reused-connection"
 )
 
-// Start begins monitoring the cluster referenced by the default kube configuration until
-// context is finished.
-func Start(ctx context.Context) (*Monitor, error) {
-	m := NewMonitorWithInterval(time.Second)
+func GetMonitorRESTConfig() (*rest.Config, error) {
 	cfg := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(clientcmd.NewDefaultClientConfigLoadingRules(), &clientcmd.ConfigOverrides{})
 	clusterConfig, err := cfg.ClientConfig()
 	if err != nil {
 		return nil, fmt.Errorf("could not load client configuration: %v", err)
 	}
-	client, err := kubernetes.NewForConfig(clusterConfig)
+
+	return clusterConfig, nil
+}
+
+// Start begins monitoring the cluster referenced by the default kube configuration until
+// context is finished.
+func Start(ctx context.Context, restConfig *rest.Config) (*Monitor, error) {
+	m := NewMonitorWithInterval(time.Second)
+	client, err := kubernetes.NewForConfig(restConfig)
 	if err != nil {
 		return nil, err
 	}
-	configClient, err := configclientset.NewForConfig(clusterConfig)
+	configClient, err := configclientset.NewForConfig(restConfig)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := StartKubeAPIMonitoringWithNewConnections(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartKubeAPIMonitoringWithNewConnections(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
-	if err := StartOpenShiftAPIMonitoringWithNewConnections(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartOpenShiftAPIMonitoringWithNewConnections(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
-	if err := StartOAuthAPIMonitoringWithNewConnections(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartOAuthAPIMonitoringWithNewConnections(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
-	if err := StartKubeAPIMonitoringWithConnectionReuse(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartKubeAPIMonitoringWithConnectionReuse(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
-	if err := StartOpenShiftAPIMonitoringWithConnectionReuse(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartOpenShiftAPIMonitoringWithConnectionReuse(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
-	if err := StartOAuthAPIMonitoringWithConnectionReuse(ctx, m, clusterConfig, 5*time.Second); err != nil {
+	if err := StartOAuthAPIMonitoringWithConnectionReuse(ctx, m, restConfig, 5*time.Second); err != nil {
 		return nil, err
 	}
 	startPodMonitoring(ctx, m, client)
 	startNodeMonitoring(ctx, m, client)
 	startEventMonitoring(ctx, m, client)
+
+	// add interval creation at the same point where we add the monitors
 	startClusterOperatorMonitoring(ctx, m, configClient)
+	m.intervalCreationFns = append(
+		m.intervalCreationFns,
+		intervalcreation.IntervalsFromEvents_OperatorAvailable,
+		intervalcreation.IntervalsFromEvents_OperatorProgressing,
+		intervalcreation.IntervalsFromEvents_OperatorDegraded,
+		intervalcreation.IntervalsFromEvents_E2ETests,
+		intervalcreation.IntervalsFromEvents_NodeChanges,
+	)
 
 	m.StartSampling(ctx)
 	return m, nil
@@ -132,44 +147,43 @@ func startServerMonitoring(ctx context.Context, m *Monitor, clusterConfig *rest.
 		Transport: roundTripper,
 	}
 
-	m.AddSampler(
-		StartSampling(ctx, m, time.Second, func(previous bool) (condition *Condition, next bool) {
-			resp, err := httpClient.Get(clusterConfig.Host + url)
+	go NewSampler(m, time.Second, func(previous bool) (condition *monitorapi.Condition, next bool) {
+		resp, err := httpClient.Get(clusterConfig.Host + url)
 
-			// we don't have an error, but the response code was an error, then we have to set an artificial error for the logic below to work.
-			if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 399) {
-				body, err := ioutil.ReadAll(resp.Body)
-				if err == nil {
-					err = fmt.Errorf("error running request: %v: %v", resp.Status, string(body))
-				} else {
-					err = fmt.Errorf("error running request: %v", resp.Status)
-				}
+		// we don't have an error, but the response code was an error, then we have to set an artificial error for the logic below to work.
+		if err == nil && (resp.StatusCode < 200 || resp.StatusCode > 399) {
+			body, err := ioutil.ReadAll(resp.Body)
+			if err == nil {
+				err = fmt.Errorf("error running request: %v: %v", resp.Status, string(body))
+			} else {
+				err = fmt.Errorf("error running request: %v", resp.Status)
 			}
-			if resp != nil && resp.Body != nil {
-				defer resp.Body.Close()
-			}
+		}
+		if resp != nil && resp.Body != nil {
+			defer resp.Body.Close()
+		}
 
-			switch {
-			case err == nil && !previous:
-				condition = &Condition{
-					Level:   Info,
-					Locator: resourceLocator,
-					Message: fmt.Sprintf("%s started responding to GET requests", resourceLocator),
-				}
-			case err != nil && previous:
-				condition = &Condition{
-					Level:   Error,
-					Locator: resourceLocator,
-					Message: fmt.Sprintf("%s started failing: %v", resourceLocator, err),
-				}
+		switch {
+		case err == nil && !previous:
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Info,
+				Locator: resourceLocator,
+				Message: fmt.Sprintf("%s started responding to GET requests", resourceLocator),
 			}
-			return condition, err == nil
-		}).ConditionWhenFailing(&Condition{
-			Level:   Error,
-			Locator: resourceLocator,
-			Message: fmt.Sprintf("%s is not responding to GET requests", resourceLocator),
-		}),
-	)
+		case err != nil && previous:
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Error,
+				Locator: resourceLocator,
+				Message: fmt.Sprintf("%s started failing: %v", resourceLocator, err),
+			}
+		}
+		return condition, err == nil
+	}).WhenFailing(ctx, &monitorapi.Condition{
+		Level:   monitorapi.Error,
+		Locator: resourceLocator,
+		Message: fmt.Sprintf("%s is not responding to GET requests", resourceLocator),
+	})
+
 	return nil
 }
 
@@ -248,10 +262,6 @@ func locatePod(pod *corev1.Pod) string {
 	return fmt.Sprintf("ns/%s pod/%s node/%s", pod.Namespace, pod.Name, pod.Spec.NodeName)
 }
 
-func locateNode(node *corev1.Node) string {
-	return fmt.Sprintf("node/%s", node.Name)
-}
-
 func locatePodContainer(pod *corev1.Pod, containerName string) string {
 	return fmt.Sprintf("ns/%s pod/%s node/%s container/%s", pod.Namespace, pod.Name, pod.Spec.NodeName, containerName)
 }
@@ -301,8 +311,8 @@ func (w *errorRecordingListWatcher) handle(err error) {
 	defer w.lock.Unlock()
 	if err != nil {
 		if !w.receivedError {
-			w.recorder.Record(Condition{
-				Level:   Error,
+			w.recorder.Record(monitorapi.Condition{
+				Level:   monitorapi.Error,
 				Locator: "kube-apiserver",
 				Message: fmt.Sprintf("failed contacting the API: %v", err),
 			})

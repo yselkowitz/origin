@@ -106,7 +106,8 @@ var staticSuites = testSuites{
 				return strings.Contains(name, "[Feature:EtcdRecovery]") || strings.Contains(name, "[Feature:NodeRecovery]") || isStandardEarlyTest(name)
 
 			},
-			TestTimeout:         60 * time.Minute,
+			// Duration of the quorum restore test exceeds 60 minutes.
+			TestTimeout:         90 * time.Minute,
 			SyntheticEventTests: ginkgo.JUnitForEventsFunc(synthetictests.SystemEventInvariants),
 		},
 		PreSuite: suiteWithProviderPreSuite,
@@ -316,6 +317,14 @@ var staticSuites = testSuites{
 				if isDisabled(name) {
 					return false
 				}
+				// Skip NetworkPolicy tests for https://bugzilla.redhat.com/show_bug.cgi?id=1980141
+				if strings.Contains(name, "[Feature:NetworkPolicy]") {
+					return false
+				}
+				// Serial:Self are tests that can't be run in parallel with a copy of itself
+				if strings.Contains(name, "[Serial:Self]") {
+					return false
+				}
 				return (strings.Contains(name, "[Suite:openshift/conformance/") && strings.Contains(name, "[sig-network]")) || isStandardEarlyOrLateTest(name)
 			},
 			Parallelism:         60,
@@ -339,6 +348,26 @@ var staticSuites = testSuites{
 			},
 		},
 		PreSuite: suiteWithProviderPreSuite,
+	},
+	{
+		TestSuite: ginkgo.TestSuite{
+			Name: "experimental/reliability/minimal",
+			Description: templates.LongDesc(`
+		Set of highly reliable tests.
+		`),
+			Matches: func(name string) bool {
+
+				_, exists := minimal[name]
+				if !exists {
+					return false
+				}
+				return !isDisabled(name) && strings.Contains(name, "[Suite:openshift/conformance")
+			},
+			Parallelism:          20,
+			MaximumAllowedFlakes: 15,
+			SyntheticEventTests:  ginkgo.JUnitForEventsFunc(synthetictests.StableSystemEventInvariants),
+		},
+		PreSuite: suiteWithKubeTestInitializationPreSuite,
 	},
 	{
 		TestSuite: ginkgo.TestSuite{
@@ -375,7 +404,7 @@ func isStandardEarlyOrLateTest(name string) bool {
 // suiteWithInitializedProviderPreSuite loads the provider info, but does not
 // exclude any tests specific to that provider.
 func suiteWithInitializedProviderPreSuite(opt *runOptions) error {
-	config, err := decodeProvider(opt.Provider, opt.DryRun, true)
+	config, err := decodeProvider(opt.Provider, opt.DryRun, true, nil)
 	if err != nil {
 		return err
 	}
@@ -386,13 +415,13 @@ func suiteWithInitializedProviderPreSuite(opt *runOptions) error {
 }
 
 // suiteWithProviderPreSuite ensures that the suite filters out tests from providers
-// that aren't relevant (see getProviderMatchFn) by loading the provider info from the
-// cluster or flags.
+// that aren't relevant (see exutilcluster.ClusterConfig.MatchFn) by loading the
+// provider info from the cluster or flags.
 func suiteWithProviderPreSuite(opt *runOptions) error {
 	if err := suiteWithInitializedProviderPreSuite(opt); err != nil {
 		return err
 	}
-	opt.MatchFn = getProviderMatchFn(opt.config)
+	opt.MatchFn = opt.config.MatchFn()
 	return nil
 }
 

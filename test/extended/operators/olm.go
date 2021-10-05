@@ -8,11 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/go-github/github"
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 
 	exutil "github.com/openshift/origin/test/extended/util"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 )
 
@@ -90,7 +90,13 @@ var _ = g.Describe("[sig-operator] OLM should", func() {
 				e2e.Failf("Unable to get %s, error:%v", msg, err)
 			}
 			o.Expect(err).NotTo(o.HaveOccurred())
-			o.Expect(msg).To(o.Equal("IfNotPresent"))
+
+			// ensure that all containers in the current deployment contain the IfNotPresent
+			// image pull policy
+			policies := strings.Split(msg, " ")
+			for _, policy := range policies {
+				o.Expect(policy).To(o.Equal("IfNotPresent"))
+			}
 		}
 	})
 
@@ -119,16 +125,15 @@ var _ = g.Describe("[sig-arch] ocp payload should be based on existing source", 
 	// TODO: This test should be more generic and across components
 	// OCP-20981, [BZ 1626434]The olm/catalog binary should output the exact version info
 	// author: jiazha@redhat.com
-	g.It("[Serial] olm version should contain the source commit id", func() {
+	g.It("OLM version should contain the source commit id", func() {
 		sameCommit := ""
 		subPods := []string{"catalog-operator", "olm-operator", "packageserver"}
 
 		for _, v := range subPods {
 			podName, err := oc.AsAdmin().Run("get").Args("-n", "openshift-operator-lifecycle-manager", "pods", "-l", fmt.Sprintf("app=%s", v), "-o=jsonpath={.items[0].metadata.name}").Output()
 			o.Expect(err).NotTo(o.HaveOccurred())
-			e2e.Logf("get pod name:%s", podName)
 
-			g.By(fmt.Sprintf("get olm version from the %s pod", v))
+			g.By(fmt.Sprintf("get olm version from pod %s", podName))
 			oc.SetNamespace("openshift-operator-lifecycle-manager")
 			olmVersion, err := oc.AsAdmin().Run("exec").Args("-n", "openshift-operator-lifecycle-manager", podName, "--", "olm", "--version").Output()
 			o.Expect(err).NotTo(o.HaveOccurred())
@@ -141,20 +146,32 @@ var _ = g.Describe("[sig-arch] ocp payload should be based on existing source", 
 
 			if sameCommit == "" {
 				sameCommit = gitCommitID
-				g.By("checking this commitID in the operator-lifecycle-manager repo")
-				client := github.NewClient(nil)
-				_, _, err := client.Git.GetCommit(context.Background(), "operator-framework", "operator-lifecycle-manager", gitCommitID)
-				if err != nil {
-					e2e.Failf("Git.GetCommit returned error: %v", err)
-				}
-				o.Expect(err).NotTo(o.HaveOccurred())
 
 			} else if gitCommitID != sameCommit {
-				e2e.Failf("These commitIDs inconformity!!!")
+				e2e.Failf("commitIDs of components within OLM do not match, possible build anomalies")
 			}
 		}
 	})
 })
+
+func archHasDefaultIndex(oc *exutil.CLI) bool {
+	workerNodes, err := oc.AsAdmin().KubeClient().CoreV1().Nodes().List(context.Background(), metav1.ListOptions{LabelSelector: "node-role.kubernetes.io/worker"})
+	if err != nil {
+		e2e.Logf("problem getting nodes for arch check: %s", err)
+	}
+	for _, node := range workerNodes.Items {
+		switch node.Status.NodeInfo.Architecture {
+		case "amd64":
+			return true
+		case "ppc64le":
+			return true
+		case "s390x":
+			return true
+		default:
+		}
+	}
+	return false
+}
 
 func hasRedHatOperatorsSource(oc *exutil.CLI) (bool, error) {
 	spec, err := oc.AsAdmin().Run("get").Args("operatorhub/cluster", "-o=jsonpath={.spec}").Output()
@@ -175,7 +192,7 @@ func hasRedHatOperatorsSource(oc *exutil.CLI) (bool, error) {
 		return true, fmt.Errorf("Error unmarshalling operatorhub spec: %s", spec)
 	}
 	// Check if default hub sources are used
-	if len(parsed.Sources) == 0 && !parsed.DisableAllDefaultSources {
+	if len(parsed.Sources) == 0 && !parsed.DisableAllDefaultSources && archHasDefaultIndex(oc) {
 		return true, nil
 	}
 
@@ -244,7 +261,7 @@ var _ = g.Describe("[sig-operator] an end user can use OLM", func() {
 		}, 5*time.Minute, time.Second).Should(o.Equal([]string{""}))
 
 		for _, v := range files {
-			configFile, err := oc.AsAdmin().Run("process").Args("--ignore-unknown-parameters=true", "-f", v, "-p", "NAME=test-operator", fmt.Sprintf("NAMESPACE=%s", oc.Namespace()), "SOURCENAME=redhat-operators", "SOURCENAMESPACE=openshift-marketplace", "PACKAGE=amq-streams", "CHANNEL=stable").OutputToFile("config.json")
+			configFile, err := oc.AsAdmin().Run("process").Args("--ignore-unknown-parameters=true", "-f", v, "-p", "NAME=test-operator", fmt.Sprintf("NAMESPACE=%s", oc.Namespace()), "SOURCENAME=redhat-operators", "SOURCENAMESPACE=openshift-marketplace", "PACKAGE=cluster-logging", "CHANNEL=stable").OutputToFile("config.json")
 			o.Expect(err).NotTo(o.HaveOccurred())
 			err = oc.AsAdmin().WithoutNamespace().Run("create").Args("-f", configFile).Execute()
 			o.Expect(err).NotTo(o.HaveOccurred())

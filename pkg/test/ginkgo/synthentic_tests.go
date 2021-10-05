@@ -3,10 +3,11 @@ package ginkgo
 import (
 	"bytes"
 	"fmt"
-	"sort"
 	"time"
 
-	"github.com/openshift/origin/pkg/monitor"
+	"k8s.io/client-go/rest"
+
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
 )
 
 // JUnitsForEvents returns a set of JUnit results for the provided events encountered
@@ -15,74 +16,42 @@ type JUnitsForEvents interface {
 	// JUnitsForEvents returns a set of additional test passes or failures implied by the
 	// events sent during the test suite run. If passed is false, the entire suite is failed.
 	// To set a test as flaky, return a passing and failing JUnitTestCase with the same name.
-	JUnitsForEvents(events monitor.EventIntervals, duration time.Duration) []*JUnitTestCase
+	JUnitsForEvents(events monitorapi.Intervals, duration time.Duration, kubeClientConfig *rest.Config) []*JUnitTestCase
 }
 
 // JUnitForEventsFunc converts a function into the JUnitForEvents interface.
-type JUnitForEventsFunc func(events monitor.EventIntervals, duration time.Duration) []*JUnitTestCase
+// kubeClientConfig may or may not be present.  The JUnit evaluation needs to tolerate a missing *rest.Config
+// and an unavailable cluster without crashing.
+type JUnitForEventsFunc func(events monitorapi.Intervals, duration time.Duration, kubeClientConfig *rest.Config) []*JUnitTestCase
 
-func (fn JUnitForEventsFunc) JUnitsForEvents(events monitor.EventIntervals, duration time.Duration) []*JUnitTestCase {
-	return fn(events, duration)
+func (fn JUnitForEventsFunc) JUnitsForEvents(events monitorapi.Intervals, duration time.Duration, kubeClientConfig *rest.Config) []*JUnitTestCase {
+	return fn(events, duration, kubeClientConfig)
 }
 
 // JUnitsForAllEvents aggregates multiple JUnitsForEvent interfaces and returns
 // the result of all invocations. It ignores nil interfaces.
 type JUnitsForAllEvents []JUnitsForEvents
 
-func (a JUnitsForAllEvents) JUnitsForEvents(events monitor.EventIntervals, duration time.Duration) []*JUnitTestCase {
+func (a JUnitsForAllEvents) JUnitsForEvents(events monitorapi.Intervals, duration time.Duration, kubeClientConfig *rest.Config) []*JUnitTestCase {
 	var all []*JUnitTestCase
 	for _, obj := range a {
 		if obj == nil {
 			continue
 		}
-		results := obj.JUnitsForEvents(events, duration)
+		results := obj.JUnitsForEvents(events, duration, kubeClientConfig)
 		all = append(all, results...)
 	}
 	return all
 }
 
-func createEventsForTests(tests []*testCase) []*monitor.EventInterval {
-	eventsForTests := []*monitor.EventInterval{}
-	for _, test := range tests {
-		if !test.failed {
-			continue
-		}
-		eventsForTests = append(eventsForTests,
-			&monitor.EventInterval{
-				From: test.start,
-				To:   test.end,
-				Condition: &monitor.Condition{
-					Level:   monitor.Info,
-					Locator: fmt.Sprintf("test=%q", test.name),
-					Message: "running",
-				},
-			},
-			&monitor.EventInterval{
-				From: test.end,
-				To:   test.end,
-				Condition: &monitor.Condition{
-					Level:   monitor.Info,
-					Locator: fmt.Sprintf("test=%q", test.name),
-					Message: "failed",
-				},
-			},
-		)
-	}
-	return eventsForTests
-}
-
-func createSyntheticTestsFromMonitor(m *monitor.Monitor, eventsForTests []*monitor.EventInterval, monitorDuration time.Duration) ([]*JUnitTestCase, *bytes.Buffer, *bytes.Buffer) {
+func createSyntheticTestsFromMonitor(events monitorapi.Intervals, monitorDuration time.Duration) ([]*JUnitTestCase, *bytes.Buffer, *bytes.Buffer) {
 	var syntheticTestResults []*JUnitTestCase
-
-	events := m.Events(time.Time{}, time.Time{})
-	events = append(events, eventsForTests...)
-	sort.Sort(events)
 
 	buf, errBuf := &bytes.Buffer{}, &bytes.Buffer{}
 	fmt.Fprintf(buf, "\nTimeline:\n\n")
 	errorCount := 0
 	for _, event := range events {
-		if event.Level == monitor.Error {
+		if event.Level == monitorapi.Error {
 			errorCount++
 			fmt.Fprintln(errBuf, event.String())
 		}

@@ -25,9 +25,11 @@ import (
 	rbacv1client "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
+	conformancetestdata "k8s.io/kubernetes/test/conformance/testdata"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/framework/testfiles"
-	"k8s.io/kubernetes/test/e2e/generated"
+	e2etestingmanifests "k8s.io/kubernetes/test/e2e/testing-manifests"
+	testfixtures "k8s.io/kubernetes/test/fixtures"
 
 	// this appears to inexplicably auto-register global flags.
 	_ "k8s.io/kubernetes/test/e2e/storage/drivers"
@@ -60,10 +62,9 @@ func InitTest(dryRun bool) error {
 
 	TestContext.DeleteNamespace = os.Getenv("DELETE_NAMESPACE") != "false"
 	TestContext.VerifyServiceAccount = true
-	testfiles.AddFileSource(testfiles.BindataFileSource{
-		Asset:      generated.Asset,
-		AssetNames: generated.AssetNames,
-	})
+	testfiles.AddFileSource(e2etestingmanifests.GetE2ETestingManifestsFS())
+	testfiles.AddFileSource(testfixtures.GetTestFixturesFS())
+	testfiles.AddFileSource(conformancetestdata.GetConformanceTestdataFS())
 	TestContext.KubectlPath = "kubectl"
 	TestContext.KubeConfig = KubeConfigPath()
 	os.Setenv("KUBECONFIG", TestContext.KubeConfig)
@@ -209,14 +210,23 @@ func createTestingNS(baseName string, c kclientset.Interface, labels map[string]
 		baseName = "e2e-" + baseName
 	}
 
+	// we skip SCC if this is a kube e2e test
+	isKubeE2ENamespace := strings.HasPrefix(baseName, "e2e-k8s-") || (isKubernetesE2ETest() && !skipTestNamespaceCustomization())
+	if isKubeE2ENamespace {
+		if labels == nil {
+			labels = map[string]string{}
+		}
+		labels["security.openshift.io/disable-securitycontextconstraints"] = "true"
+	}
+
 	ns, err := e2e.CreateTestingNS(baseName, c, labels)
 	if err != nil {
 		return ns, err
 	}
 
 	// Add anyuid and privileged permissions for upstream tests
-	if strings.HasPrefix(baseName, "e2e-k8s-") || (isKubernetesE2ETest() && !skipTestNamespaceCustomization()) {
-		clientConfig, err := getClientConfig(KubeConfigPath())
+	if isKubeE2ENamespace {
+		clientConfig, err := GetClientConfig(KubeConfigPath())
 		if err != nil {
 			return ns, err
 		}

@@ -18,9 +18,13 @@ import (
 	oauthv1 "github.com/openshift/api/oauth/v1"
 	userv1 "github.com/openshift/api/user/v1"
 	exutil "github.com/openshift/origin/test/extended/util"
+	"github.com/openshift/origin/test/extended/util/ibmcloud"
+
+	e2e "k8s.io/kubernetes/test/e2e/framework"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 )
 
-const authzTokenName string = "oauth-client-with-plus-with-more-than-thirty-two-characters-in-this-very-long-name"
+var authzToken, sha256AuthzToken = exutil.GenerateOAuthTokenPair()
 
 var _ = g.Describe("[sig-auth][Feature:OAuthServer]", func() {
 	defer g.GinkgoRecover()
@@ -29,6 +33,10 @@ var _ = g.Describe("[sig-auth][Feature:OAuthServer]", func() {
 
 	g.Describe("ClientSecretWithPlus", func() {
 		g.It(fmt.Sprintf("should create oauthclient"), func() {
+			if e2e.TestContext.Provider == ibmcloud.ProviderName {
+				e2eskipper.Skipf("IBM Cloud clusters do not contain oauth-openshift routes")
+			}
+
 			g.By("create oauth client")
 			oauthClient, err := oc.AdminOauthClient().OauthV1().OAuthClients().Create(ctx, &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{
@@ -65,7 +73,7 @@ var _ = g.Describe("[sig-auth][Feature:OAuthServer]", func() {
 				g.By("create synthetic authz token")
 				oauthAuthorizeToken, err := oc.AdminOauthClient().OauthV1().OAuthAuthorizeTokens().Create(ctx, &oauthv1.OAuthAuthorizeToken{
 					ObjectMeta: metav1.ObjectMeta{
-						Name: authzTokenName,
+						Name: sha256AuthzToken,
 					},
 					ClientName:          oauthClient.Name,
 					ExpiresIn:           100000000,
@@ -108,7 +116,7 @@ var _ = g.Describe("[sig-auth][Feature:OAuthServer]", func() {
 func queryClientAuthRequest(host string) *http.Request {
 	req, err := http.NewRequest("POST", "https://"+host+"/oauth/token?"+
 		"grant_type=authorization_code&"+
-		"code="+authzTokenName+"&"+
+		"code="+authzToken+"&"+
 		"client_id=oauth-client-with-plus&"+
 		"client_secret=secret%2Bwith%2Bplus",
 		nil)
@@ -120,7 +128,7 @@ func queryClientAuthRequest(host string) *http.Request {
 func bodyClientAuthRequest(host string) *http.Request {
 	req, err := http.NewRequest("POST", "https://"+host+"/oauth/token",
 		bytes.NewBufferString("grant_type=authorization_code&"+
-			"code="+authzTokenName+"&"+
+			"code="+authzToken+"&"+
 			"client_id=oauth-client-with-plus&"+
 			"client_secret=secret%2Bwith%2Bplus",
 		),
@@ -133,7 +141,7 @@ func bodyClientAuthRequest(host string) *http.Request {
 func headerClientAuthRequest(host string) *http.Request {
 	req, err := http.NewRequest("POST", "https://"+host+"/oauth/token",
 		bytes.NewBufferString("grant_type=authorization_code&"+
-			"code="+authzTokenName,
+			"code="+authzToken,
 		),
 	)
 	o.Expect(err).NotTo(o.HaveOccurred())

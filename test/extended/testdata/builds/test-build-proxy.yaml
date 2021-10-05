@@ -35,7 +35,7 @@ items:
           value: 127.0.0.1:3128
         from:
           kind: DockerImage
-          name: quay.io/redhat-developer/test-build-simples2i:latest
+          name: registry.ci.openshift.org/ocp/4.8:test-build-simples2i
 - kind: BuildConfig
   apiVersion: v1
   metadata:
@@ -57,7 +57,7 @@ items:
       sourceStrategy:
         from:
           kind: DockerImage
-          name: quay.io/redhat-developer/test-build-simples2i:latest
+          name: registry.ci.openshift.org/ocp/4.8:test-build-simples2i
         env:
         - name: SOME_HTTP_PROXY
           value: https://envuser:password@proxy3.com
@@ -84,9 +84,25 @@ items:
       dockerStrategy:
         from:
           kind: DockerImage
-          name: image-registry.openshift-image-registry.svc:5000/openshift/ruby:2.7
+          name: image-registry.openshift-image-registry.svc:5000/openshift/ruby:2.7-ubi8
         env:
         - name: SOME_HTTP_PROXY
           value: https://envuser:password@proxy3.com
         - name: SOME_HTTPS_PROXY
           value: https://envuser:password@proxy4.com
+- kind: BuildConfig
+  apiVersion: build.openshift.io/v1
+  metadata:
+    name: sample-docker-build-proxy-ca
+  spec:
+    mountTrustedCA: true
+    source:
+      dockerfile: |
+        FROM registry.redhat.io/ubi8/ubi:latest
+        RUN cat /etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+    strategy:
+      dockerStrategy:
+        from:
+          kind: ImageStreamTag
+          name: cli
+          namespace: openshift

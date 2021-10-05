@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+	monitorserialization "github.com/openshift/origin/pkg/monitor/serialization"
+
 	g "github.com/onsi/ginkgo"
 
 	"k8s.io/kubernetes/test/e2e/chaosmonkey"
@@ -21,8 +25,6 @@ import (
 	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
 	"k8s.io/kubernetes/test/e2e/upgrades"
 	"k8s.io/kubernetes/test/utils/junit"
-
-	"github.com/openshift/origin/pkg/monitor"
 )
 
 // testWithDisplayName is implemented by tests that want more descriptive test names
@@ -50,6 +52,19 @@ type flakeSummary string
 func (s flakeSummary) PrintHumanReadable() string { return string(s) }
 func (s flakeSummary) SummaryKind() string        { return "Flake" }
 func (s flakeSummary) PrintJSON() string          { return `{"type":"Flake"}` }
+
+// additionalEvents is a test summary type that allows tests to add additional
+// events to the summary
+type additionalEvents struct {
+	Events monitorapi.Intervals
+}
+
+func (s additionalEvents) PrintHumanReadable() string { return strings.Join(s.Events.Strings(), "\n") }
+func (s additionalEvents) SummaryKind() string        { return "AdditionalEvents" }
+func (s additionalEvents) PrintJSON() string {
+	data, _ := monitorserialization.EventsIntervalsToJSON(s.Events)
+	return string(data)
+}
 
 // TestData is passed to the invariant tests executed during the upgrade. The default UpgradeType
 // is MasterUpgrade.
@@ -176,10 +191,11 @@ func (cma *chaosMonkeyAdapter) Test(sem *chaosmonkey.Semaphore) {
 }
 
 func finalizeTest(start time.Time, tc *junit.TestCase, ts *junit.TestSuite, f *framework.Framework) {
-	tc.Time = time.Since(start).Seconds()
+	now := time.Now().UTC()
+	tc.Time = now.Sub(start).Seconds()
 	r := recover()
 
-	// if the framework contains additional test results, add them to the parent suite
+	// if the framework contains additional test results, add them to the parent suite or write them to disk
 	for _, summary := range f.TestSummaries {
 		if test, ok := summary.(additionalTest); ok {
 			testCase := &junit.TestCase{
@@ -194,6 +210,11 @@ func finalizeTest(start time.Time, tc *junit.TestCase, ts *junit.TestSuite, f *f
 			}
 			ts.TestCases = append(ts.TestCases, testCase)
 			continue
+		}
+
+		filePath := filepath.Join(framework.TestContext.ReportDir, fmt.Sprintf("%s_%s_%s.json", summary.SummaryKind(), filesystemSafeName(tc.Name), now.Format(time.RFC3339)))
+		if err := ioutil.WriteFile(filePath, []byte(summary.PrintJSON()), 0644); err != nil {
+			fmt.Fprintf(os.Stderr, "error: Failed to write file %v with test data: %v\n", filePath, err)
 		}
 	}
 
@@ -241,6 +262,16 @@ func finalizeTest(start time.Time, tc *junit.TestCase, ts *junit.TestSuite, f *f
 	}
 }
 
+var (
+	reFilesystemSafe      = regexp.MustCompile(`[^a-zA-Z1-9_]`)
+	reFilesystemDuplicate = regexp.MustCompile(`_+`)
+)
+
+func filesystemSafeName(s string) string {
+	s = reFilesystemSafe.ReplaceAllString(s, "_")
+	return reFilesystemDuplicate.ReplaceAllString(s, "_")
+}
+
 // isGoModulePath returns true if the packagePath reported by reflection is within a
 // module and given module path. When go mod is in use, module and modulePath are not
 // contiguous as they were in older golang versions with vendoring, so naive contains
@@ -271,6 +302,7 @@ func createTestFrameworks(tests []upgrades.Test) map[string]*framework.Framework
 				ClientQPS:   20,
 				ClientBurst: 50,
 			},
+			Timeouts: framework.NewTimeoutContextWithDefaults(),
 		}
 	}
 	return testFrameworks
@@ -279,8 +311,10 @@ func createTestFrameworks(tests []upgrades.Test) map[string]*framework.Framework
 // ExpectNoDisruption fails if the sum of the duration of all events exceeds tolerate as a fraction ([0-1]) of total, reports a
 // disruption flake if any disruption occurs, and uses reason to prefix the message. I.e. tolerate 0.1 of 10m total will fail
 // if the sum of the intervals is greater than 1m, or report a flake if any interval is found.
-func ExpectNoDisruption(f *framework.Framework, tolerate float64, total time.Duration, events monitor.EventIntervals, reason string) {
-	duration, describe := GetDisruption(events, "")
+func ExpectNoDisruption(f *framework.Framework, tolerate float64, total time.Duration, events monitorapi.Intervals, reason string) {
+	FrameworkEventIntervals(f, events)
+	duration := events.Duration(0, 1*time.Second)
+	describe := events.Strings()
 	if percent := float64(duration) / float64(total); percent > tolerate {
 		framework.Failf("%s for at least %s of %s (%0.0f%%):\n\n%s", reason, duration.Truncate(time.Second), total.Truncate(time.Second), percent*100, strings.Join(describe, "\n"))
 	} else if duration > 0 {
@@ -288,31 +322,15 @@ func ExpectNoDisruption(f *framework.Framework, tolerate float64, total time.Dur
 	}
 }
 
-// GetDisruption returns total duration of all error events and array of event description for printing.
-// When requiredLocator is specified (non-empty), only events matching this locator are considered.
-func GetDisruption(events monitor.EventIntervals, requiredLocator string) (time.Duration, []string) {
-	var duration time.Duration
-	var describe []string
-	for _, interval := range events {
-		if requiredLocator != "" && requiredLocator != interval.Locator {
-			continue
-		}
-		describe = append(describe, interval.String())
-		i := interval.To.Sub(interval.From)
-		if i < time.Second {
-			i = time.Second
-		}
-		if interval.Condition.Level > monitor.Info {
-			duration += i
-		}
-	}
-	return duration, describe
-}
-
 // FrameworkFlakef records a flake on the current framework.
 func FrameworkFlakef(f *framework.Framework, format string, options ...interface{}) {
 	framework.Logf(format, options...)
 	f.TestSummaries = append(f.TestSummaries, flakeSummary(fmt.Sprintf(format, options...)))
+}
+
+// FrameworkFlakef records a flake on the current framework.
+func FrameworkEventIntervals(f *framework.Framework, events monitorapi.Intervals) {
+	f.TestSummaries = append(f.TestSummaries, additionalEvents{Events: events})
 }
 
 // hasFrameworkFlake returns true if the framework recorded a flake message generated by

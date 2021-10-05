@@ -3,15 +3,17 @@ package synthetictests
 import (
 	"bytes"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
-	"github.com/openshift/origin/pkg/monitor"
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+
 	"github.com/openshift/origin/pkg/test/ginkgo"
 	"k8s.io/apimachinery/pkg/util/sets"
 )
 
-func testKubeletToAPIServerGracefulTermination(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testKubeletToAPIServerGracefulTermination(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
 	const testName = "[sig-node] kubelet terminates kube-apiserver gracefully"
 
 	var failures []string
@@ -43,7 +45,7 @@ func testKubeletToAPIServerGracefulTermination(events []*monitor.EventInterval) 
 	return tests
 }
 
-func testKubeAPIServerGracefulTermination(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testKubeAPIServerGracefulTermination(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
 	const testName = "[sig-api-machinery] kube-apiserver terminates within graceful termination period"
 
 	var failures []string
@@ -71,7 +73,128 @@ func testKubeAPIServerGracefulTermination(events []*monitor.EventInterval) []*gi
 	return tests
 }
 
-func testPodTransitions(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testContainerFailures(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
+	containerExits := make(map[string][]string)
+	failures := []string{}
+	for _, event := range events {
+		if !strings.Contains(event.Locator, "ns/openshift-") {
+			continue
+		}
+		switch {
+		// errors during container start should be highlighted because they are unexpected
+		case strings.Contains(event.Message, "reason/ContainerWait "):
+			// excluded https://bugzilla.redhat.com/show_bug.cgi?id=1933760
+			if strings.Contains(event.Message, "possible container status clear") || strings.Contains(event.Message, "cause/ContainerCreating ") {
+				continue
+			}
+			failures = append(failures, fmt.Sprintf("%v - %v", event.Locator, event.Message))
+
+		// workload containers should never exit non-zero during normal operations
+		case strings.Contains(event.Message, "reason/ContainerExit") && !strings.Contains(event.Message, "code/0"):
+			containerExits[event.Locator] = append(containerExits[event.Locator], event.Message)
+		}
+	}
+
+	var excessiveExits []string
+	for locator, messages := range containerExits {
+		if len(messages) > 1 {
+			messageSet := sets.NewString(messages...)
+			excessiveExits = append(excessiveExits, fmt.Sprintf("%s restarted %d times:\n%s", locator, len(messages), strings.Join(messageSet.List(), "\n")))
+		}
+	}
+	sort.Strings(excessiveExits)
+
+	var testCases []*ginkgo.JUnitTestCase
+
+	const failToStartTestName = "[sig-architecture] platform pods should not fail to start"
+	if len(failures) > 0 {
+		testCases = append(testCases, &ginkgo.JUnitTestCase{
+			Name:      failToStartTestName,
+			SystemOut: strings.Join(failures, "\n"),
+			FailureOutput: &ginkgo.FailureOutput{
+				Output: fmt.Sprintf("%d container starts had issues\n\n%s", len(failures), strings.Join(failures, "\n")),
+			},
+		})
+	}
+	// mark flaky for now while we debug
+	testCases = append(testCases, &ginkgo.JUnitTestCase{Name: failToStartTestName})
+
+	const excessiveRestartTestName = "[sig-architecture] platform pods should not exit more than once with a non-zero exit code"
+	if len(excessiveExits) > 0 {
+		testCases = append(testCases, &ginkgo.JUnitTestCase{
+			Name:      excessiveRestartTestName,
+			SystemOut: strings.Join(excessiveExits, "\n"),
+			FailureOutput: &ginkgo.FailureOutput{
+				Output: fmt.Sprintf("%d containers with multiple restarts\n\n%s", len(excessiveExits), strings.Join(excessiveExits, "\n\n")),
+			},
+		})
+	}
+	// mark flaky for now while we debug
+	testCases = append(testCases, &ginkgo.JUnitTestCase{Name: excessiveRestartTestName})
+
+	return testCases
+}
+
+func testKubeApiserverProcessOverlap(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
+	const testName = "[sig-node] overlapping apiserver process detected during kube-apiserver rollout"
+	success := &ginkgo.JUnitTestCase{Name: testName}
+	failures := []string{}
+	for _, event := range events {
+		if strings.Contains(event.Message, "reason/TerminationProcessOverlapDetected") {
+			failures = append(failures, fmt.Sprintf("[%s - %s] %s", event.From, event.To, event.Locator))
+		}
+	}
+
+	if len(failures) == 0 {
+		return []*ginkgo.JUnitTestCase{success}
+	}
+
+	failure := &ginkgo.JUnitTestCase{
+		Name:      testName,
+		SystemOut: strings.Join(failures, "\n"),
+		FailureOutput: &ginkgo.FailureOutput{
+			Output: fmt.Sprintf("The following events detected:\n\n%s", strings.Join(failures, "\n")),
+		},
+	}
+	return []*ginkgo.JUnitTestCase{failure}
+}
+
+func testDeleteGracePeriodZero(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
+	const testName = "[sig-architecture] platform pods should not be force deleted with gracePeriod 0"
+	success := &ginkgo.JUnitTestCase{Name: testName}
+
+	failures := []string{}
+	for _, event := range events {
+		if !strings.Contains(event.Message, "reason/ForceDelete") {
+			continue
+		}
+		if !strings.Contains(event.Locator, "ns/openshift-") {
+			continue
+		}
+		if strings.Contains(event.Message, "mirrored/true") {
+			continue
+		}
+		if strings.Contains(event.Message, "node/ ") {
+			continue
+		}
+		failures = append(failures, event.Locator)
+	}
+	if len(failures) == 0 {
+		return []*ginkgo.JUnitTestCase{success}
+	}
+
+	failure := &ginkgo.JUnitTestCase{
+		Name:      testName,
+		SystemOut: strings.Join(failures, "\n"),
+		FailureOutput: &ginkgo.FailureOutput{
+			Output: fmt.Sprintf("The following pods were force deleted and should not be:\n\n%s", strings.Join(failures, "\n")),
+		},
+	}
+	// TODO: marked flaky until has been thoroughly debugged
+	return []*ginkgo.JUnitTestCase{failure, success}
+}
+
+func testPodTransitions(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
 	const testName = "[sig-node] pods should never transition back to pending"
 	success := &ginkgo.JUnitTestCase{Name: testName}
 
@@ -104,7 +227,7 @@ func formatTimes(times []time.Time) []string {
 	return s
 }
 
-func testNodeUpgradeTransitions(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testNodeUpgradeTransitions(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
 	const testName = "[sig-node] nodes should not go unready after being upgraded and go unready only once"
 
 	var buf bytes.Buffer
@@ -125,13 +248,13 @@ func testNodeUpgradeTransitions(events []*monitor.EventInterval) []*ginkgo.JUnit
 				fmt.Fprintf(&buf, "DEBUG: found upgrade start event: %v\n", event.String())
 				break
 			}
-			if !strings.HasPrefix(event.Locator, "node/") {
+			if !monitorapi.IsNode(event.Locator) {
 				continue
 			}
 			if !strings.HasPrefix(event.Message, "condition/Ready ") || !strings.HasSuffix(event.Message, " changed") {
 				continue
 			}
-			node := strings.TrimPrefix(event.Locator, "node/")
+			node, _ := monitorapi.NodeFromLocator(event.Locator)
 			if strings.Contains(event.Message, " status/True ") {
 				if currentNodeReady[node] {
 					failures = append(failures, fmt.Sprintf("Node %s was reported ready twice in a row, this should be impossible", node))
@@ -205,7 +328,7 @@ func testNodeUpgradeTransitions(events []*monitor.EventInterval) []*ginkgo.JUnit
 	return testCases
 }
 
-func testSystemDTimeout(events []*monitor.EventInterval) []*ginkgo.JUnitTestCase {
+func testSystemDTimeout(events monitorapi.Intervals) []*ginkgo.JUnitTestCase {
 	const testName = "[sig-node] pods should not fail on systemd timeouts"
 	success := &ginkgo.JUnitTestCase{Name: testName}
 

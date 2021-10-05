@@ -32,7 +32,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 
-	etcdv3 "go.etcd.io/etcd/clientv3"
+	etcdv3 "go.etcd.io/etcd/client/v3"
 )
 
 // Etcd data for all persisted OpenShift objects.
@@ -240,7 +240,7 @@ func testEtcd3StoragePath(t g.GinkgoTInterface, kubeConfig *restclient.Config, e
 	etcddataCRDs := etcddata.GetCustomResourceDefinitionData()
 	etcddata.CreateTestCRDs(tt, crdClient, false, etcddataCRDs...)
 	defer func() {
-		deleteCRD := crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().Delete
+		deleteCRD := crdClient.ApiextensionsV1().CustomResourceDefinitions().Delete
 		ctx := context.Background()
 		delOptions := metav1.DeleteOptions{}
 		var errs []error
@@ -279,29 +279,64 @@ func testEtcd3StoragePath(t g.GinkgoTInterface, kubeConfig *restclient.Config, e
 
 	etcdStorageData := etcddata.GetEtcdStorageData()
 
+	// OpenShift runs the etcd storage tests as e2e, upstream as integration test. Hence, we have to patch up
+	// nodes that otherwise get deleted by the node controller.
+	nodeGvr := schema.GroupVersionResource{Version: "v1", Resource: "nodes"}
+	if _, ok := etcdStorageData[nodeGvr]; !ok {
+		t.Fatal("expected v1 nodes")
+	}
+	if expected, got := `{"metadata": {"name": "node1"}, "spec": {"unschedulable": true}}`, etcdStorageData[nodeGvr].Stub; got != expected {
+		t.Fatal("node v1 stub changed, got %q, expected %q", got, expected)
+	}
+	nodeData := etcdStorageData[nodeGvr]
+	nodeData.Stub = `{"metadata": {"name": "node1"}, "spec": {"unschedulable": true}, "status": {"conditions":[{"type":"Ready", "status":"True"}]}}`
+	etcdStorageData[nodeGvr] = nodeData
+
 	removeStorageData(t, etcdStorageData,
-		// these alphas resources are not enabled in a real cluster but worked fine in the integration test
-		gvr("batch", "v2alpha1", "cronjobs"),
+		// disabled alpha versions
+		gvr("flowcontrol.apiserver.k8s.io", "v1alpha1", "flowschemas"),
+		gvr("flowcontrol.apiserver.k8s.io", "v1alpha1", "prioritylevelconfigurations"),
+		gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"),
 		gvr("node.k8s.io", "v1alpha1", "runtimeclasses"),
 		gvr("rbac.authorization.k8s.io", "v1alpha1", "clusterrolebindings"),
 		gvr("rbac.authorization.k8s.io", "v1alpha1", "clusterroles"),
 		gvr("rbac.authorization.k8s.io", "v1alpha1", "rolebindings"),
 		gvr("rbac.authorization.k8s.io", "v1alpha1", "roles"),
 		gvr("scheduling.k8s.io", "v1alpha1", "priorityclasses"),
+		gvr("storage.k8s.io", "v1alpha1", "csistoragecapacities"),
 		gvr("storage.k8s.io", "v1alpha1", "volumeattachments"),
-		gvr("internal.apiserver.k8s.io", "v1alpha1", "storageversions"),
+
+		// disabled beta versions
+		gvr("apiextensions.k8s.io", "v1beta1", "customresourcedefinitions"),
+		gvr("apiregistration.k8s.io", "v1beta1", "apiservices"),
+		gvr("admissionregistration.k8s.io", "v1beta1", "validatingwebhookconfigurations"),
+		gvr("admissionregistration.k8s.io", "v1beta1", "mutatingwebhookconfigurations"),
+		gvr("certificates.k8s.io", "v1beta1", "certificatesigningrequests"),
+		gvr("coordination.k8s.io", "v1beta1", "leases"),
+		gvr("extensions", "v1beta1", "ingresses"),
+		gvr("networking.k8s.io", "v1beta1", "ingressclasses"),
+		gvr("networking.k8s.io", "v1beta1", "ingresses"),
+		gvr("rbac.authorization.k8s.io", "v1beta1", "clusterrolebindings"),
+		gvr("rbac.authorization.k8s.io", "v1beta1", "clusterroles"),
+		gvr("rbac.authorization.k8s.io", "v1beta1", "rolebindings"),
+		gvr("rbac.authorization.k8s.io", "v1beta1", "roles"),
+		gvr("scheduling.k8s.io", "v1beta1", "priorityclasses"),
+		gvr("storage.k8s.io", "v1beta1", "csidrivers"),
+		gvr("storage.k8s.io", "v1beta1", "csinodes"),
+		gvr("storage.k8s.io", "v1beta1", "storageclasses"),
+		gvr("storage.k8s.io", "v1beta1", "volumeattachments"),
 	)
 
-	// Apply output of git diff origin/release-1.20 origin/release-1.21 test/integration/etcd/data.go. This is needed
+	// Apply output of git diff origin/release-1.22 origin/release-1.23 test/integration/etcd/data.go. This is needed
 	// to apply the right data depending on the kube version of the running server. Replace this with the next current
 	// and rebase version next time. Don't pile them up.
-	if strings.HasPrefix(version.Minor, "21") {
+	if strings.HasPrefix(version.Minor, "23") {
 		namespace := "etcdstoragepathtestnamespace"
 		_ = namespace
 
 		// Added etcd data.
 		for k, a := range map[schema.GroupVersionResource]etcddata.StorageData{} {
-			// TODO: fill when 1.21 rebase has started
+			// TODO: fill when 1.23 rebase has started
 
 			if _, preexisting := etcdStorageData[k]; preexisting {
 				t.Errorf("upstream etcd storage data already has data for %v. Update current and rebase version diff to next rebase version", k)
@@ -310,23 +345,14 @@ func testEtcd3StoragePath(t g.GinkgoTInterface, kubeConfig *restclient.Config, e
 		}
 
 		// Modified etcd data.
-		// TODO: fill when 1.21 rebase has started
+		// TODO: fill when 1.23 rebase has started
 
 		// Removed etcd data.
-		// TODO: fill when 1.21 rebase has started
+		// TODO: fill when 1.23 rebase has started
 		removeStorageData(t, etcdStorageData)
 
 	} else {
-		// Remove 1.19 only alpha versions
-		removeStorageData(t, etcdStorageData) // these alphas resources are not enabled in a real cluster but worked fine in the integration test
-	}
-
-	// flowcontrol may or may not be on.  This allows us to ratchet in turning it on.
-	if flowControlResources, err := kubeClient.Discovery().ServerResourcesForGroupVersion("flowcontrol.apiserver.k8s.io/v1alpha1"); err != nil || len(flowControlResources.APIResources) == 0 {
-		removeStorageData(t, etcdStorageData,
-			gvr("flowcontrol.apiserver.k8s.io", "v1alpha1", "flowschemas"),
-			gvr("flowcontrol.apiserver.k8s.io", "v1alpha1", "prioritylevelconfigurations"),
-		)
+		removeStorageData(t, etcdStorageData)
 	}
 
 	// we use a different default path prefix for kube resources
@@ -505,7 +531,7 @@ func testEtcd3StoragePath(t g.GinkgoTInterface, kubeConfig *restclient.Config, e
 }
 
 func getCRDs(t g.GinkgoTInterface, crdClient *apiextensionsclientset.Clientset) map[schema.GroupVersionResource]empty {
-	crdList, err := crdClient.ApiextensionsV1beta1().CustomResourceDefinitions().List(context.Background(), metav1.ListOptions{})
+	crdList, err := crdClient.ApiextensionsV1().CustomResourceDefinitions().List(context.Background(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -517,9 +543,6 @@ func getCRDs(t g.GinkgoTInterface, crdClient *apiextensionsclientset.Clientset) 
 		}
 		group := crd.Spec.Group
 		resource := crd.Spec.Names.Plural
-		if len(crd.Spec.Version) != 0 {
-			crds[gvr(group, crd.Spec.Version, resource)] = empty{}
-		}
 		for _, version := range crd.Spec.Versions {
 			if !version.Served {
 				continue

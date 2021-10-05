@@ -22,6 +22,7 @@ var (
 	cliInterval        = 5 * time.Second
 	cliTimeout         = 1 * time.Minute
 	extendedCliTimeout = 2 * time.Minute
+	deleteCliTimeout   = 3 * time.Minute
 )
 
 var _ = g.Describe("[sig-cli] oc adm", func() {
@@ -309,7 +310,7 @@ var _ = g.Describe("[sig-cli] oc adm", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(out).To(o.HaveSuffix("yes"))
 
-		oc.Run("delete").Args("policy-can-i").Execute()
+		oc.Run("delete").Args("project/policy-can-i").Execute()
 	})
 
 	g.It("role-reapers", func() {
@@ -418,7 +419,7 @@ var _ = g.Describe("[sig-cli] oc adm", func() {
 		// Test deleting and recreating a project
 		o.Expect(oc.Run("adm", "new-project").Args("recreated-project", "--admin=createuser1").Execute()).To(o.Succeed())
 		o.Expect(oc.Run("delete").Args("project", "recreated-project").Execute()).To(o.Succeed())
-		err := wait.Poll(cliInterval, cliTimeout, func() (bool, error) {
+		err := wait.Poll(cliInterval, deleteCliTimeout, func() (bool, error) {
 			out, err := ocns.Run("get").Args("project/recreated-project").Output()
 			return err != nil && strings.Contains(out, "not found"), nil
 		})
@@ -446,11 +447,9 @@ var _ = g.Describe("[sig-cli] oc adm", func() {
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(out).To(o.ContainSubstring("origin-ruby-sample:latest"))
 
-		out, err = ocns.Run("adm", "build-chain").Args("ruby-27-centos7", "-o", "dot").Output()
+		out, err = ocns.Run("adm", "build-chain").Args("ruby-27", "-o", "dot").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
-		o.Expect(out).To(o.ContainSubstring(`digraph "ruby-27-centos7:latest"`))
-
-		ocns.Run("delete").Args("all", "-l", "build=sti").Execute()
+		o.Expect(out).To(o.ContainSubstring(`digraph "ruby-27:latest"`))
 	})
 
 	g.It("serviceaccounts", func() {

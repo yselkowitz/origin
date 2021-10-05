@@ -13,11 +13,11 @@ import (
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
-
-	"go.etcd.io/etcd/clientv3"
-	"go.etcd.io/etcd/etcdserver/etcdserverpb"
-	"go.etcd.io/etcd/pkg/transport"
+	"go.etcd.io/etcd/api/v3/etcdserverpb"
+	"go.etcd.io/etcd/client/pkg/v3/transport"
+	"go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -27,9 +27,9 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
-
 	"k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/upgrades"
+	"k8s.io/kubernetes/test/e2e/upgrades/network"
 
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/disruption"
@@ -60,11 +60,14 @@ var _ = g.Describe("[sig-cluster-lifecycle][Feature:DisasterRecovery][Disruptive
 		disruption.Run(f, "Machine Shutdown and Restore", "machine_failure",
 			disruption.TestData{},
 			[]upgrades.Test{
-				&upgrades.ServiceUpgradeTest{},
+				&network.ServiceUpgradeTest{},
 				controlplane.NewKubeAvailableWithNewConnectionsTest(),
 				controlplane.NewOpenShiftAvailableNewConnectionsTest(),
 				controlplane.NewOAuthAvailableNewConnectionsTest(),
-				&frontends.AvailableTest{},
+				frontends.NewOAuthRouteAvailableWithNewConnectionsTest(),
+				frontends.NewOAuthRouteAvailableWithConnectionReuseTest(),
+				frontends.NewConsoleRouteAvailableWithNewConnectionsTest(),
+				frontends.NewConsoleRouteAvailableWithConnectionReuseTest(),
 			},
 			func() {
 

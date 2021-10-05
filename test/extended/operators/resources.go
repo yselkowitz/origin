@@ -36,68 +36,6 @@ var _ = g.Describe("[sig-arch] Managed cluster", func() {
 		// pods that have a bug opened, every entry here must have a bug associated
 		knownBrokenPods := map[string]string{
 			//"<apiVersion>/<kind>/<namespace>/<name>/(initContainer|container)/<container_name>/<violation_type>": "<url to bug>",
-
-			"apps/v1/DaemonSet/openshift-ovn-kubernetes/ovnkube-master/container/sbdb/request[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1939752",
-			"apps/v1/DaemonSet/openshift-ovn-kubernetes/ovnkube-master/container/sbdb/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1939752",
-
-			"apps/v1/DaemonSet/openshift-multus/multus-admission-controller/container/multus-admission-controller/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1938469",
-
-			"apps/v1/Deployment/openshift-kube-scheduler-operator/openshift-kube-scheduler-operator/container/kube-scheduler-operator-container/request[cpu]": "https://bugzilla.redhat.com/show_bug.cgi?id=1938468",
-
-			"apps/v1/Deployment/openshift-machine-api/cluster-autoscaler-default/container/cluster-autoscaler/request[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1938467",
-			"apps/v1/Deployment/openshift-machine-api/cluster-autoscaler-default/container/cluster-autoscaler/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1938467",
-			"apps/v1/Deployment/openshift-monitoring/thanos-querier/container/thanos-query/request[cpu]":                       "https://bugzilla.redhat.com/show_bug.cgi?id=1938465",
-			"apps/v1/Deployment/openshift-operator-lifecycle-manager/packageserver/container/packageserver/request[cpu]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1938466",
-			"apps/v1/Deployment/openshift-operator-lifecycle-manager/packageserver/container/packageserver/request[memory]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1938466",
-
-			"batch/v1/Job/openshift-marketplace/<batch_job>/container/extract/request[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1938492",
-			"batch/v1/Job/openshift-marketplace/<batch_job>/container/extract/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1938492",
-
-			// Some of these may be allowed to be retained, but proper approval is needed
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-machine-mtrc/limit[cpu]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-machine-mtrc/limit[memory]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-machineset-mtrc/limit[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-machineset-mtrc/limit[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-mhc-mtrc/limit[cpu]":           "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/kube-rbac-proxy-mhc-mtrc/limit[memory]":        "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machine-controller/limit[cpu]":                 "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machine-controller/limit[memory]":              "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machine-healthcheck-controller/limit[cpu]":     "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machine-healthcheck-controller/limit[memory]":  "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machineset-controller/limit[cpu]":              "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/machineset-controller/limit[memory]":           "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/nodelink-controller/limit[cpu]":                "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-controllers/container/nodelink-controller/limit[memory]":             "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-operator/container/kube-rbac-proxy/limit[cpu]":                       "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-operator/container/kube-rbac-proxy/limit[memory]":                    "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-operator/container/machine-api-operator/limit[cpu]":                  "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-			"apps/v1/Deployment/openshift-machine-api/machine-api-operator/container/machine-api-operator/limit[memory]":               "https://bugzilla.redhat.com/show_bug.cgi?id=1938493",
-
-			"apps/v1/DaemonSet/openshift-machine-api/metal3-image-cache/container/metal3-httpd/request[cpu]":          "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/DaemonSet/openshift-machine-api/metal3-image-cache/container/metal3-httpd/request[memory]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/ironic-deploy-ramdisk-logs/request[cpu]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/ironic-deploy-ramdisk-logs/request[memory]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/ironic-inspector-ramdisk-logs/request[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/ironic-inspector-ramdisk-logs/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-baremetal-operator/request[cpu]":        "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-baremetal-operator/request[memory]":     "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-dnsmasq/request[cpu]":                   "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-dnsmasq/request[memory]":                "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-httpd/request[cpu]":                     "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-httpd/request[memory]":                  "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-api/request[cpu]":                "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-api/request[memory]":             "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-conductor/request[cpu]":          "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-conductor/request[memory]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-inspector/request[cpu]":          "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-ironic-inspector/request[memory]":       "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-mariadb/request[cpu]":                   "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-mariadb/request[memory]":                "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-static-ip-manager/request[cpu]":         "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-			"apps/v1/Deployment/openshift-machine-api/metal3/container/metal3-static-ip-manager/request[memory]":      "https://bugzilla.redhat.com/show_bug.cgi?id=1940518",
-
-			"apps/v1/Deployment/openshift-cluster-csi-drivers/ovirt-csi-driver-controller/container/csi-provisioner/request[cpu]":    "https://bugzilla.redhat.com/show_bug.cgi?id=1940876",
-			"apps/v1/Deployment/openshift-cluster-csi-drivers/ovirt-csi-driver-controller/container/csi-provisioner/request[memory]": "https://bugzilla.redhat.com/show_bug.cgi?id=1940876",
 		}
 
 		// pods with an exception granted, the value should be the justification and the approver (a release architect)
@@ -126,6 +64,7 @@ var _ = g.Describe("[sig-arch] Managed cluster", func() {
 		}
 
 		reNormalizeRunOnceNames := regexp.MustCompile(`^(installer-|revision-pruner-)[\d]+-`)
+		reNormalizeRetryNames := regexp.MustCompile(`-retry-[\d]+-`)
 
 		waitingForFix := sets.NewString()
 		notAllowed := sets.NewString()
@@ -187,6 +126,9 @@ var _ = g.Describe("[sig-arch] Managed cluster", func() {
 					controller = fmt.Sprintf("v1/Pod/%s/%s", pod.Namespace, name)
 				}
 			}
+
+			// Remove -retry-#- for, e.g. openshift-etcd/installer-<revision>-retry-1-<node>
+			controller = reNormalizeRetryNames.ReplaceAllString(controller, "-")
 
 			// These rules apply to both init and regular containers
 			for containerType, containers := range map[string][]v1.Container{

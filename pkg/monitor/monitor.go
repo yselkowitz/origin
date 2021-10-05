@@ -4,19 +4,30 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
+
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/cache"
 )
 
 // Monitor records events that have occurred in memory and can also periodically
 // sample results.
 type Monitor struct {
-	interval time.Duration
-	samplers []SamplerFunc
+	interval            time.Duration
+	samplers            []SamplerFunc
+	intervalCreationFns []IntervalCreationFunc
 
-	lock    sync.Mutex
-	events  []*Event
-	samples []*sample
+	lock           sync.Mutex
+	events         monitorapi.Intervals
+	unsortedEvents monitorapi.Intervals
+	samples        []*sample
+
+	recordedResourceLock sync.Mutex
+	recordedResources    monitorapi.ResourcesMap
 }
 
 // NewMonitor creates a monitor with the default sampling interval.
@@ -28,7 +39,8 @@ func NewMonitor() *Monitor {
 // interval.
 func NewMonitorWithInterval(interval time.Duration) *Monitor {
 	return &Monitor{
-		interval: interval,
+		interval:          interval,
+		recordedResources: monitorapi.ResourcesMap{},
 	}
 }
 
@@ -65,9 +77,99 @@ func (m *Monitor) AddSampler(fn SamplerFunc) {
 	m.samplers = append(m.samplers, fn)
 }
 
+func (m *Monitor) CurrentResourceState() monitorapi.ResourcesMap {
+	m.recordedResourceLock.Lock()
+	defer m.recordedResourceLock.Unlock()
+
+	ret := monitorapi.ResourcesMap{}
+	for resourceType, instanceResourceMap := range m.recordedResources {
+		retInstance := monitorapi.InstanceMap{}
+		for instanceKey, obj := range instanceResourceMap {
+			retInstance[instanceKey] = obj.DeepCopyObject()
+		}
+		ret[resourceType] = retInstance
+	}
+
+	return ret
+}
+
+func (m *Monitor) RecordResource(resourceType string, obj runtime.Object) {
+	m.recordedResourceLock.Lock()
+	defer m.recordedResourceLock.Unlock()
+
+	recordedResource, ok := m.recordedResources[resourceType]
+	if !ok {
+		recordedResource = monitorapi.InstanceMap{}
+		m.recordedResources[resourceType] = recordedResource
+	}
+
+	key, err := cache.MetaNamespaceKeyFunc(obj)
+	if err != nil {
+		// coding error
+		panic(err)
+	}
+
+	toStore := obj.DeepCopyObject()
+	newMetadata, _ := meta.Accessor(toStore)
+	// without metadata, just stomp in the new value, we can't add annotations
+	if newMetadata == nil {
+		recordedResource[key] = toStore
+		return
+	}
+
+	newAnnotations := newMetadata.GetAnnotations()
+	if newAnnotations == nil {
+		newAnnotations = map[string]string{}
+	}
+	existingResource, ok := recordedResource[key]
+	if !ok {
+		if newMetadata != nil {
+			newAnnotations[monitorapi.ObservedUpdateCountAnnotation] = "1"
+			newAnnotations[monitorapi.ObservedRecreationCountAnnotation] = "0"
+			newMetadata.SetAnnotations(newAnnotations)
+		}
+		recordedResource[key] = toStore
+		return
+	}
+
+	existingMetadata, _ := meta.Accessor(existingResource)
+	// without metadata, just stomp in the new value, we can't add annotations
+	if existingMetadata == nil {
+		recordedResource[key] = toStore
+		return
+	}
+
+	existingAnnotations := existingMetadata.GetAnnotations()
+	if existingAnnotations == nil {
+		existingAnnotations = map[string]string{}
+	}
+	existingUpdateCountStr := existingAnnotations[monitorapi.ObservedUpdateCountAnnotation]
+	if existingUpdateCount, err := strconv.ParseInt(existingUpdateCountStr, 10, 32); err != nil {
+		newAnnotations[monitorapi.ObservedUpdateCountAnnotation] = "1"
+	} else {
+		newAnnotations[monitorapi.ObservedUpdateCountAnnotation] = fmt.Sprintf("%d", existingUpdateCount+1)
+	}
+
+	// set the recreate count. increment if the UIDs don't match
+	existingRecreateCountStr := existingAnnotations[monitorapi.ObservedUpdateCountAnnotation]
+	if existingMetadata.GetUID() != newMetadata.GetUID() {
+		if existingRecreateCount, err := strconv.ParseInt(existingRecreateCountStr, 10, 32); err != nil {
+			newAnnotations[monitorapi.ObservedRecreationCountAnnotation] = existingRecreateCountStr
+		} else {
+			newAnnotations[monitorapi.ObservedRecreationCountAnnotation] = fmt.Sprintf("%d", existingRecreateCount+1)
+		}
+	} else {
+		newAnnotations[monitorapi.ObservedRecreationCountAnnotation] = existingRecreateCountStr
+	}
+
+	newMetadata.SetAnnotations(newAnnotations)
+	recordedResource[key] = toStore
+	return
+}
+
 // Record captures one or more conditions at the current time. All conditions are recorded
-// in monotonic order as Event objects.
-func (m *Monitor) Record(conditions ...Condition) {
+// in monotonic order as EventInterval objects.
+func (m *Monitor) Record(conditions ...monitorapi.Condition) {
 	if len(conditions) == 0 {
 		return
 	}
@@ -75,9 +177,51 @@ func (m *Monitor) Record(conditions ...Condition) {
 	defer m.lock.Unlock()
 	t := time.Now().UTC()
 	for _, condition := range conditions {
-		m.events = append(m.events, &Event{
-			At:        t,
+		m.events = append(m.events, monitorapi.EventInterval{
 			Condition: condition,
+			From:      t,
+			To:        t,
+		})
+	}
+}
+
+// StartInterval inserts a record at time t with the provided condition and returns an opaque
+// locator to the interval. The caller may close the sample at any point by invoking EndInterval().
+func (m *Monitor) StartInterval(t time.Time, condition monitorapi.Condition) int {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	m.unsortedEvents = append(m.unsortedEvents, monitorapi.EventInterval{
+		Condition: condition,
+		From:      t,
+	})
+	return len(m.unsortedEvents) - 1
+}
+
+// EndInterval updates the To of the interval started by StartInterval if t is greater than
+// the from.
+func (m *Monitor) EndInterval(startedInterval int, t time.Time) {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	if startedInterval < len(m.unsortedEvents) {
+		if m.unsortedEvents[startedInterval].From.Before(t) {
+			m.unsortedEvents[startedInterval].To = t
+		}
+	}
+}
+
+// RecordAt captures one or more conditions at the provided time. All conditions are recorded
+// as EventInterval objects.
+func (m *Monitor) RecordAt(t time.Time, conditions ...monitorapi.Condition) {
+	if len(conditions) == 0 {
+		return
+	}
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for _, condition := range conditions {
+		m.unsortedEvents = append(m.unsortedEvents, monitorapi.EventInterval{
+			Condition: condition,
+			From:      t,
+			To:        t,
 		})
 	}
 }
@@ -88,7 +232,7 @@ func (m *Monitor) sample(hasPrevious bool) bool {
 	m.lock.Unlock()
 
 	now := time.Now().UTC()
-	var conditions []*Condition
+	var conditions []*monitorapi.Condition
 	for _, fn := range samplers {
 		conditions = append(conditions, fn(now)...)
 	}
@@ -100,66 +244,58 @@ func (m *Monitor) sample(hasPrevious bool) bool {
 
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	t := time.Now().UTC()
 	m.samples = append(m.samples, &sample{
-		at:         t,
+		at:         now,
 		conditions: conditions,
 	})
 	return len(conditions) > 0
 }
 
-func (m *Monitor) snapshot() ([]*sample, []*Event) {
+func (m *Monitor) snapshot() ([]*sample, monitorapi.Intervals, monitorapi.Intervals) {
 	m.lock.Lock()
 	defer m.lock.Unlock()
-	return m.samples, m.events
+	return m.samples, m.events, m.unsortedEvents
 }
 
 // Conditions returns all conditions that were sampled in the interval
 // between from and to. If that does not include a sample interval, no
-// results will be returned. EventIntervals are returned in order of
+// results will be returned. Intervals are returned in order of
 // their first sampling. A condition that was only sampled once is
 // returned with from == to. No duplicate conditions are returned
 // unless a sampling interval did not report that value.
-func (m *Monitor) Conditions(from, to time.Time) EventIntervals {
-	samples, _ := m.snapshot()
+func (m *Monitor) Conditions(from, to time.Time) monitorapi.Intervals {
+	samples, _, _ := m.snapshot()
 	return filterSamples(samples, from, to)
 }
 
-// Events returns all events that occur between from and to, including
+// EventIntervals returns all events that occur between from and to, including
 // any sampled conditions that were encountered during that period.
-// EventIntervals are returned in order of their occurrence.
-func (m *Monitor) Events(from, to time.Time) EventIntervals {
-	samples, events := m.snapshot()
-	intervals := filterSamples(samples, from, to)
-	events = filterEvents(events, from, to)
+// Intervals are returned in order of their occurrence. The returned slice
+// is a copy of the monitor's state and is safe to update.
+func (m *Monitor) Intervals(from, to time.Time) monitorapi.Intervals {
+	samples, sortedEvents, unsortedEvents := m.snapshot()
 
-	// merge the two sets of inputs
-	mustSort := len(intervals) > 0
-	for i := range events {
-		if i > 0 && events[i-1].At.After(events[i].At) {
-			fmt.Printf("ERROR: event %d out of order\n  %#v\n  %#v\n", i, events[i-1], events[i])
-		}
+	intervals := mergeIntervals(sortedEvents.Slice(from, to), unsortedEvents.CopyAndSort(from, to), filterSamples(samples, from, to))
+	originalLen := len(intervals)
 
-		to := events[i].At
-		from := events[i].InitiatedAt
-		if from.IsZero() {
-			from = to
-		}
-
-		condition := &events[i].Condition
-		intervals = append(intervals, &EventInterval{
-			From:      from,
-			To:        to,
-			Condition: condition,
-		})
+	// create additional intervals from events
+	for _, createIntervals := range m.intervalCreationFns {
+		intervals = append(intervals, createIntervals(intervals, from, to)...)
 	}
-	if mustSort {
+
+	// we must sort the result
+	if len(intervals) != originalLen {
 		sort.Sort(intervals)
 	}
+
 	return intervals
 }
 
-func filterSamples(samples []*sample, from, to time.Time) EventIntervals {
+// filterSamples converts the sorted samples that are within [from,to) to a set of
+// intervals.
+// TODO: simplify this by having the monitor samplers produce intervals themselves
+//   and make the streaming print logic simply show transitions.
+func filterSamples(samples []*sample, from, to time.Time) monitorapi.Intervals {
 	if len(samples) == 0 {
 		return nil
 	}
@@ -186,8 +322,8 @@ func filterSamples(samples []*sample, from, to time.Time) EventIntervals {
 		return nil
 	}
 
-	intervals := make(EventIntervals, 0, len(samples)*2)
-	last, next := make(map[Condition]*EventInterval), make(map[Condition]*EventInterval)
+	intervals := make(monitorapi.Intervals, 0, len(samples)*2)
+	last, next := make(map[monitorapi.Condition]*monitorapi.EventInterval), make(map[monitorapi.Condition]*monitorapi.EventInterval)
 	for _, sample := range samples {
 		for _, condition := range sample.conditions {
 			interval, ok := last[*condition]
@@ -196,13 +332,12 @@ func filterSamples(samples []*sample, from, to time.Time) EventIntervals {
 				next[*condition] = interval
 				continue
 			}
-			interval = &EventInterval{
-				Condition: condition,
+			intervals = append(intervals, monitorapi.EventInterval{
+				Condition: *condition,
 				From:      sample.at,
-				To:        sample.at,
-			}
-			next[*condition] = interval
-			intervals = append(intervals, interval)
+				To:        sample.at.Add(time.Second),
+			})
+			next[*condition] = &intervals[len(intervals)-1]
 		}
 		for k := range last {
 			delete(last, k)
@@ -212,24 +347,18 @@ func filterSamples(samples []*sample, from, to time.Time) EventIntervals {
 	return intervals
 }
 
-func filterEvents(events []*Event, from, to time.Time) []*Event {
-	if from.IsZero() && to.IsZero() {
-		return events
+// mergeEvents returns a sorted list of all events provided as sources. This could be
+// more efficient by requiring all sources to be sorted and then performing a zipper
+// merge.
+func mergeIntervals(sets ...monitorapi.Intervals) monitorapi.Intervals {
+	total := 0
+	for _, set := range sets {
+		total += len(set)
 	}
-
-	first := sort.Search(len(events), func(i int) bool {
-		return events[i].At.After(from)
-	})
-	if first == -1 {
-		return nil
+	merged := make(monitorapi.Intervals, 0, total)
+	for _, set := range sets {
+		merged = append(merged, set...)
 	}
-	if to.IsZero() {
-		return events[first:]
-	}
-	for i := first; i < len(events); i++ {
-		if events[i].At.After(to) {
-			return events[first:i]
-		}
-	}
-	return events[first:]
+	sort.Sort(merged)
+	return merged
 }

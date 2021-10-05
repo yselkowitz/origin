@@ -1,101 +1,38 @@
 package monitor
 
 import (
-	"fmt"
-	"sort"
-	"strconv"
-	"strings"
 	"time"
+
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
-type SamplerFunc func(time.Time) []*Condition
+type IntervalCreationFunc func(intervals monitorapi.Intervals, beginning, end time.Time) monitorapi.Intervals
+
+type SamplerFunc func(time.Time) []*monitorapi.Condition
 
 type Interface interface {
-	Events(from, to time.Time) EventIntervals
-	Conditions(from, to time.Time) EventIntervals
+	Intervals(from, to time.Time) monitorapi.Intervals
+	Conditions(from, to time.Time) monitorapi.Intervals
+	CurrentResourceState() monitorapi.ResourcesMap
 }
 
 type Recorder interface {
-	Record(conditions ...Condition)
+	// RecordResource stores a resource for later serialization.  Deletion is not tracked, so this can be used
+	// to determine the final state of resource that are deleted in a namespace.
+	// Annotations are added to indicate number of updates and the number of recreates.
+	RecordResource(resourceType string, obj runtime.Object)
+
+	Record(conditions ...monitorapi.Condition)
+	RecordAt(t time.Time, conditions ...monitorapi.Condition)
+
+	StartInterval(t time.Time, condition monitorapi.Condition) int
+	EndInterval(startedInterval int, t time.Time)
+
 	AddSampler(fn SamplerFunc)
-}
-
-type EventLevel int
-
-const (
-	Info EventLevel = iota
-	Warning
-	Error
-)
-
-var eventString = []string{
-	"I",
-	"W",
-	"E",
-}
-
-type Event struct {
-	Condition
-
-	At time.Time
-}
-
-func (e *Event) String() string {
-	return fmt.Sprintf("%s.%03d %s %s %s", e.At.Format("Jan 02 15:04:05"), e.At.Nanosecond()/1000000, eventString[e.Level], e.Locator, strings.Replace(e.Message, "\n", "\\n", -1))
 }
 
 type sample struct {
 	at         time.Time
-	conditions []*Condition
-}
-
-type Condition struct {
-	Level EventLevel
-
-	Locator string
-	Message string
-
-	InitiatedAt time.Time
-}
-
-type EventInterval struct {
-	*Condition
-
-	From time.Time
-	To   time.Time
-}
-
-func (i *EventInterval) String() string {
-	if i.From.Equal(i.To) {
-		return fmt.Sprintf("%s.%03d %s %s %s", i.From.Format("Jan 02 15:04:05"), i.From.Nanosecond()/int(time.Millisecond), eventString[i.Level], i.Locator, strings.Replace(i.Message, "\n", "\\n", -1))
-	}
-	duration := i.To.Sub(i.From)
-	if duration < time.Second {
-		return fmt.Sprintf("%s.%03d - %-5s %s %s %s", i.From.Format("Jan 02 15:04:05"), i.From.Nanosecond()/int(time.Millisecond), strconv.Itoa(int(duration/time.Millisecond))+"ms", eventString[i.Level], i.Locator, strings.Replace(i.Message, "\n", "\\n", -1))
-	}
-	return fmt.Sprintf("%s.%03d - %-5s %s %s %s", i.From.Format("Jan 02 15:04:05"), i.From.Nanosecond()/int(time.Millisecond), strconv.Itoa(int(duration/time.Second))+"s", eventString[i.Level], i.Locator, strings.Replace(i.Message, "\n", "\\n", -1))
-}
-
-type EventIntervals []*EventInterval
-
-var _ sort.Interface = EventIntervals{}
-
-func (intervals EventIntervals) Less(i, j int) bool {
-	switch d := intervals[i].From.Sub(intervals[j].From); {
-	case d < 0:
-		return true
-	case d > 0:
-		return false
-	}
-	switch d := intervals[i].To.Sub(intervals[j].To); {
-	case d < 0:
-		return true
-	case d > 0:
-		return false
-	}
-	return intervals[i].Message < intervals[j].Message
-}
-func (intervals EventIntervals) Len() int { return len(intervals) }
-func (intervals EventIntervals) Swap(i, j int) {
-	intervals[i], intervals[j] = intervals[j], intervals[i]
+	conditions []*monitorapi.Condition
 }

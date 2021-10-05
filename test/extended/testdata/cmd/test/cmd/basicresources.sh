@@ -49,23 +49,6 @@ os::test::junit::declare_suite_start "cmd/basicresources/versionreporting"
 #echo "version reporting: ok"
 os::test::junit::declare_suite_end
 
-os::test::junit::declare_suite_start "cmd/basicresources/status"
-os::cmd::expect_success_and_text 'oc status -h' 'oc describe buildconfig'
-os::cmd::expect_success_and_text 'oc status' 'oc new-app'
-echo "status help output: ok"
-os::test::junit::declare_suite_end
-
-os::test::junit::declare_suite_start "cmd/basicresources/explain"
-os::cmd::expect_failure_and_text 'oc get' 'oc api-resources'
-os::cmd::expect_success_and_text 'oc get all --loglevel=6' 'buildconfigs'
-os::cmd::expect_success_and_text 'oc explain pods' 'Pod is a collection of containers that can run on a host'
-os::cmd::expect_success_and_text 'oc explain pods.spec' 'SecurityContext holds pod-level security attributes'
-# TODO unbreak explain
-#os::cmd::expect_success_and_text 'oc explain deploymentconfig' 'a desired deployment state'
-#os::cmd::expect_success_and_text 'oc explain deploymentconfig.spec' 'ensures that this deployment config will have zero replicas'
-echo "explain: ok"
-os::test::junit::declare_suite_end
-
 os::test::junit::declare_suite_start "cmd/basicresources/resource-builder"
 # Test resource builder filtering of files with expected extensions inside directories, and individual files without expected extensions
 os::cmd::expect_success 'oc create -f ${TEST_DATA}/resource-builder/directory -f ${TEST_DATA}/resource-builder/json-no-extension -f ${TEST_DATA}/resource-builder/yml-no-extension'
@@ -84,44 +67,6 @@ os::cmd::expect_success_and_text 'oc create -f ${TEST_DATA}/hello-openshift/hell
 os::cmd::expect_success 'oc describe pod hello-openshift'
 os::cmd::expect_success 'oc delete pods hello-openshift --grace-period=0 --force'
 echo "pods: ok"
-os::test::junit::declare_suite_end
-
-os::test::junit::declare_suite_start "cmd/basicresources/label"
-os::cmd::expect_success_and_text 'oc create -f ${TEST_DATA}/hello-openshift/hello-pod.json -o name' 'pod/hello-openshift'
-os::cmd::try_until_success 'oc label pod/hello-openshift acustom=label' # can race against scheduling and status updates
-os::cmd::expect_success_and_text 'oc describe pod/hello-openshift' 'acustom=label'
-os::cmd::try_until_success 'oc annotate pod/hello-openshift foo=bar' # can race against scheduling and status updates
-os::cmd::expect_success_and_text 'oc get -o yaml pod/hello-openshift' 'foo: bar'
-os::cmd::expect_failure_and_not_text 'oc annotate pod hello-openshift description="test" --resource-version=123' 'may only be used with a single resource'
-os::cmd::expect_failure_and_text 'oc annotate pod hello-openshift hello-openshift description="test" --resource-version=123' 'may only be used with a single resource'
-os::cmd::expect_success 'oc delete pods -l acustom=label --grace-period=0 --force'
-os::cmd::expect_failure 'oc get pod/hello-openshift'
-
-# show-labels should work for projects
-os::cmd::expect_success "oc label namespace '${project}' foo=bar"
-os::cmd::expect_success_and_text "oc get project '${project}' --show-labels" "foo=bar"
-
-echo "label: ok"
-os::test::junit::declare_suite_end
-
-os::test::junit::declare_suite_start "cmd/basicresources/services"
-os::cmd::expect_success 'oc get services'
-os::cmd::expect_success 'oc create -f ${TEST_DATA}/test-service.json'
-os::cmd::expect_success 'oc delete services frontend'
-echo "services: ok"
-os::test::junit::declare_suite_end
-
-# TODO rewrite the yaml for this test to actually work
-os::test::junit::declare_suite_start "cmd/basicresources/list-version-conversion"
-os::cmd::expect_success 'oc create   -f ${TEST_DATA}/mixed-api-versions.yaml'
-os::cmd::expect_success 'oc get      -f ${TEST_DATA}/mixed-api-versions.yaml -o yaml'
-os::cmd::expect_success 'oc label    -f ${TEST_DATA}/mixed-api-versions.yaml mylabel=a'
-os::cmd::expect_success 'oc annotate -f ${TEST_DATA}/mixed-api-versions.yaml myannotation=b'
-# Make sure all six resources, with different API versions, got labeled and annotated
-os::cmd::expect_success_and_text 'oc get -f ${TEST_DATA}/mixed-api-versions.yaml --output=jsonpath="{..metadata.labels.mylabel}"'           'a a a a'
-os::cmd::expect_success_and_text 'oc get -f ${TEST_DATA}/mixed-api-versions.yaml --output=jsonpath="{..metadata.annotations.myannotation}"' 'b b b b'
-os::cmd::expect_success 'oc delete   -f ${TEST_DATA}/mixed-api-versions.yaml'
-echo "list version conversion: ok"
 os::test::junit::declare_suite_end
 
 os::test::junit::declare_suite_start "cmd/basicresources/nodes"
@@ -143,15 +88,6 @@ os::cmd::expect_success 'oc create clusterquota limit-bob --project-label-select
 os::cmd::expect_success 'oc delete clusterquota/limit-bob'
 echo "create subcommands: ok"
 os::test::junit::declare_suite_end
-
-os::test::junit::declare_suite_start "cmd/basicresources/statefulsets"
-os::cmd::expect_success 'oc create -f ${TEST_DATA}/statefulset.yaml'
-os::cmd::try_until_success 'oc get pods testapp-0'
-os::cmd::expect_success_and_text 'oc describe statefulset testapp' 'app=testapp'
-os::cmd::expect_success 'oc delete -f ${TEST_DATA}/statefulset.yaml'
-echo "statefulsets: ok"
-os::test::junit::declare_suite_end
-
 
 os::test::junit::declare_suite_start "cmd/basicresources/setprobe"
 # Validate the probe command
@@ -261,7 +197,7 @@ os::test::junit::declare_suite_end
 
 # Test OAuth access token describer
 os::cmd::expect_success 'oc create -f ${TEST_DATA}/oauthaccesstoken.yaml'
-os::cmd::expect_success_and_text "oc describe oauthaccesstoken DYGZDLucARCPIfUeKPhsgPfn0WBLR_9KdeREH0c9iod" "DYGZDLucARCPIfUeKPhsgPfn0WBLR_9KdeREH0c9iod"
+os::cmd::expect_success_and_text "oc describe oauthaccesstoken sha256~efaca6fab897953ffcb4f857eb5cbf2cf3a4c33f1314b4922656303426b1cfc9" "efaca6fab897953ffcb4f857eb5cbf2cf3a4c33f1314b4922656303426b1cfc9"
 echo "OAuth descriptor: ok"
 
 os::cmd::expect_success 'oc delete all --all'
@@ -285,7 +221,7 @@ os::cmd::expect_success_and_text 'oc create deploymentconfig --dry-run foo --ima
 os::cmd::expect_success_and_text 'oc run --dry-run foo --image=bar -o name --restart=Never'                'pod/foo'
 os::cmd::expect_success_and_text 'oc create job --dry-run foo --image=bar -o name'              'job.batch/foo'
 os::cmd::expect_success_and_text 'oc create deploymentconfig --dry-run foo --image=bar -o name' 'deploymentconfig.apps.openshift.io/foo'
-os::cmd::expect_success_and_text 'oc run --dry-run foo --image=bar -o name --generator=run-pod/v1'          'pod/foo'
+os::cmd::expect_success_and_text 'oc run --dry-run foo --image=bar -o name'          'pod/foo'
 
 os::cmd::expect_success 'oc process -f ${TEST_DATA}/application-template-stibuild.json -l name=mytemplate | oc create -f -'
 os::cmd::expect_success 'oc delete all -l name=mytemplate'

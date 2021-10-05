@@ -52,6 +52,23 @@ var upgradeSuites = testSuites{
 		},
 		PreSuite: upgradeTestPreSuite,
 	},
+	{
+		TestSuite: ginkgo.TestSuite{
+			Name: "none",
+			Description: templates.LongDesc(`
+	Don't run disruption tests.
+		`),
+			Matches: func(name string) bool {
+				if isStandardEarlyTest(name) {
+					return true
+				}
+				return strings.Contains(name, "[Feature:ClusterUpgrade]") && !strings.Contains(name, "[Suite:k8s]")
+			},
+			TestTimeout:         240 * time.Minute,
+			SyntheticEventTests: ginkgo.JUnitForEventsFunc(synthetictests.SystemUpgradeEventInvariants),
+		},
+		PreSuite: upgradeTestPreSuite,
+	},
 }
 
 // upgradeTestPreSuite validates the test options.
@@ -77,9 +94,11 @@ func upgradeTestPreTest() error {
 	parseUpgradeOptions(opt.TestOptions)
 	upgrade.SetToImage(opt.ToImage)
 	switch opt.Suite {
+	case "none":
+		return filterUpgrade(upgrade.NoTests(), func(string) bool { return true })
 	case "platform":
 		return filterUpgrade(upgrade.AllTests(), func(name string) bool {
-			return name == controlplane.NewKubeAvailableWithNewConnectionsTest().Name() || name == controlplane.NewKubeAvailableWithNewConnectionsTest().Name()
+			return name == controlplane.NewKubeAvailableWithNewConnectionsTest().Name() || name == controlplane.NewKubeAvailableWithConnectionReuseTest().Name()
 		})
 	default:
 		return filterUpgrade(upgrade.AllTests(), func(string) bool { return true })

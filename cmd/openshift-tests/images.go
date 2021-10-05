@@ -9,17 +9,15 @@ import (
 	"strings"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/klog/v2"
-
 	imagev1 "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
 	"github.com/openshift/library-go/pkg/image/reference"
-
-	"github.com/openshift/origin/pkg/monitor"
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
 	"github.com/openshift/origin/pkg/test/ginkgo"
 	"github.com/openshift/origin/test/extended/util/image"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/client-go/rest"
+	"k8s.io/klog/v2"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 	k8simage "k8s.io/kubernetes/test/utils/image"
 )
@@ -50,7 +48,17 @@ const defaultTestImageMirrorLocation = "quay.io/openshift/community-e2e-images"
 func createImageMirrorForInternalImages(prefix string, ref reference.DockerImageReference, mirrored bool) ([]string, error) {
 	source := ref.Exact()
 
-	defaults := k8simage.GetOriginalImageConfigs()
+	initialDefaults := k8simage.GetOriginalImageConfigs()
+	exceptions := image.Exceptions.List()
+	defaults := map[int]k8simage.Config{}
+	for i, config := range initialDefaults {
+		for _, exception := range exceptions {
+			if strings.Contains(config.GetE2EImage(), exception) {
+				continue
+			}
+			defaults[i] = config
+		}
+	}
 	updated := k8simage.GetMappedImageConfigs(defaults, ref.Exact())
 
 	openshiftDefaults := image.OriginalImages()
@@ -194,7 +202,7 @@ func pulledInvalidImages(fromRepository string) ginkgo.JUnitForEventsFunc {
 		// used to test pull secrets against an authenticated registry
 		// TODO: will not work for a disconnected test environment and should be emulated by launching
 		//   an authenticated registry in a pod on cluster
-		"registry.redhat.io/rhscl/nodejs-10-rhel7:latest",
+		"registry.redhat.io/ubi8/nodejs-14:latest",
 	)
 	if len(fromRepository) > 0 {
 		allowedPrefixes.Insert(fromRepository)
@@ -202,7 +210,7 @@ func pulledInvalidImages(fromRepository string) ginkgo.JUnitForEventsFunc {
 
 	// any image not in the allowed prefixes is considered a failure, as the user
 	// may have added a new test image without calling the appropriate helpers
-	return func(events monitor.EventIntervals, _ time.Duration) []*ginkgo.JUnitTestCase {
+	return func(events monitorapi.Intervals, _ time.Duration, _ *rest.Config) []*ginkgo.JUnitTestCase {
 		imageStreamPrefixes, err := imagePrefixesFromNamespaceImageStreams("openshift")
 		if err != nil {
 			klog.Errorf("Unable to identify image prefixes from the openshift namespace: %v", err)
@@ -258,6 +266,12 @@ func pulledInvalidImages(fromRepository string) ginkgo.JUnitForEventsFunc {
 				FailureOutput: &ginkgo.FailureOutput{
 					Output: fmt.Sprintf("Cluster accessed images that were not mirrored to the testing repository or already part of the cluster, see test/extended/util/image/README.md in the openshift/origin repo:\n\n%s", buf.String()),
 				},
+			})
+
+		} else {
+			// if the test passed, indicate that too.
+			tests = append(tests, &ginkgo.JUnitTestCase{
+				Name: "[sig-arch] Only known images used by tests",
 			})
 		}
 

@@ -81,7 +81,7 @@ RUN touch /test-image
 
 		g.By("determine the name of the integrated registry")
 
-		registryHost, err := oc.Run("registry").Args("info").Output()
+		registryHost, err := oc.Run("registry").Args("info", "--internal").Output()
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("build an image")
@@ -151,6 +151,9 @@ RUN touch /test-image
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		err = oc.Run("policy").Args("add-role-to-user", "testrole", "-z", "testsa", "--role-namespace="+oc.Namespace()).Execute()
+		o.Expect(err).NotTo(o.HaveOccurred())
+
+		err = exutil.WaitForServiceAccount(oc.AdminKubeClient().CoreV1().ServiceAccounts(oc.Namespace()), "testsa")
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		token, err := oc.Run("serviceaccounts").Args("get-token", "testsa").Output()

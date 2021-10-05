@@ -293,8 +293,7 @@
             "dnsPolicy": "ClusterFirst"
           }
         }
-      },
-      "status": {}
+      }
     },
     {
       "kind": "Service",
@@ -355,7 +354,7 @@
             "containers": [
               {
                 "name": "ruby-helloworld-database",
-                "image": "image-registry.openshift-image-registry.svc:5000/openshift/mysql:5.7",
+                "image": "image-registry.openshift-image-registry.svc:5000/openshift/mysql:8.0-el8",
                 "ports": [
                   {
                     "containerPort": 3306,
@@ -413,8 +412,7 @@
             "dnsPolicy": "ClusterFirst"
           }
         }
-      },
-      "status": {}
+      }
     }
   ],
   "parameters": [

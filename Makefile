@@ -61,7 +61,7 @@ update: update-bindata
 #	make update-examples
 update-examples:
 	hack/update-external-examples.sh
-	update-bindata
+	$(MAKE) update-bindata
 .PHONY: update-examples
 
 # Run tools tests.
@@ -98,4 +98,4 @@ test: test-tools
 # $5 - output
 # It will generate targets {update,verify}-bindata-$(1) logically grouping them in unsuffixed versions of these targets
 # and also hooked into {update,verify}-generated for broader integration.
-$(call add-bindata,bindata,-ignore ".*\.(go|md)$\" examples/db-templates examples/image-streams examples/sample-app examples/quickstarts/... examples/hello-openshift examples/jenkins/... examples/quickstarts/cakephp-mysql.json test/extended/testdata/...,testextended,testdata,test/extended/testdata/bindata.go)
+$(call add-bindata,bindata,-ignore ".*\.(go|md)$$$$" examples/db-templates examples/image-streams examples/sample-app examples/quickstarts/... examples/hello-openshift examples/jenkins/... examples/quickstarts/cakephp-mysql.json test/extended/testdata/... e2echart,testextended,testdata,test/extended/testdata/bindata.go)

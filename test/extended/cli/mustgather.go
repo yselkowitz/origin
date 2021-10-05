@@ -9,19 +9,18 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
 	g "github.com/onsi/ginkgo"
 	o "github.com/onsi/gomega"
 	oauthv1 "github.com/openshift/api/oauth/v1"
-	"github.com/openshift/client-go/image/clientset/versioned"
 	oauthv1client "github.com/openshift/client-go/oauth/clientset/versioned/typed/oauth/v1"
-	"github.com/openshift/library-go/pkg/image/imageutil"
+	"github.com/openshift/origin/pkg/test/ginkgo/result"
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/ibmcloud"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 )
@@ -43,7 +42,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 		defer os.RemoveAll(tempDir)
 		o.Expect(oc.Run("adm", "must-gather").Args("--dest-dir", tempDir).Execute()).To(o.Succeed())
 
-		pluginOutputDir := getPluginOutputDir(oc, tempDir)
+		pluginOutputDir := getPluginOutputDir(tempDir)
 
 		expectedDirectories := [][]string{
 			{pluginOutputDir, "cluster-scoped-resources", "config.openshift.io"},
@@ -108,7 +107,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 			"ls -l > /artifacts/ls.log",
 		}
 		o.Expect(oc.Run("adm", "must-gather").Args(args...).Execute()).To(o.Succeed())
-		expectedFilePath := path.Join(getPluginOutputDir(oc, tempDir), "ls.log")
+		expectedFilePath := path.Join(getPluginOutputDir(tempDir), "ls.log")
 		o.Expect(expectedFilePath).To(o.BeAnExistingFile())
 		stat, err := os.Stat(expectedFilePath)
 		o.Expect(err).NotTo(o.HaveOccurred())
@@ -131,11 +130,11 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 		}
 
 		// makes some tokens that should not show in the audit logs
-		const tokenName = "must-gather-audit-logs-token-plus-some-padding-here-to-make-the-limit"
+		_, sha256TokenName := exutil.GenerateOAuthTokenPair()
 		oauthClient := oauthv1client.NewForConfigOrDie(oc.AdminConfig())
 		_, err1 := oauthClient.OAuthAccessTokens().Create(context.Background(), &oauthv1.OAuthAccessToken{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: tokenName,
+				Name: sha256TokenName,
 			},
 			ClientName:  "openshift-challenging-client",
 			ExpiresIn:   30,
@@ -147,7 +146,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 		o.Expect(err1).NotTo(o.HaveOccurred())
 		_, err2 := oauthClient.OAuthAuthorizeTokens().Create(context.Background(), &oauthv1.OAuthAuthorizeToken{
 			ObjectMeta: metav1.ObjectMeta{
-				Name: tokenName,
+				Name: sha256TokenName,
 			},
 			ClientName:  "openshift-challenging-client",
 			ExpiresIn:   30,
@@ -160,7 +159,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 
 		tempDir, err := ioutil.TempDir("", "test.oc-adm-must-gather.")
 		o.Expect(err).NotTo(o.HaveOccurred())
-		// defer os.RemoveAll(tempDir)
+		defer os.RemoveAll(tempDir)
 
 		args := []string{
 			"--dest-dir", tempDir,
@@ -172,16 +171,18 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 		// wait for the contents to show up in the plugin output directory, avoiding EOF errors
 		time.Sleep(10 * time.Second)
 
-		pluginOutputDir := getPluginOutputDir(oc, tempDir)
+		pluginOutputDir := getPluginOutputDir(tempDir)
 
 		expectedDirectoriesToExpectedCount := map[string]int{
 			path.Join(pluginOutputDir, "audit_logs", "kube-apiserver"):      1000,
 			path.Join(pluginOutputDir, "audit_logs", "openshift-apiserver"): 10, // openshift apiservers don't necessarily get much traffic.  Especially early in a run
+			path.Join(pluginOutputDir, "audit_logs", "oauth-apiserver"):     10, // oauth apiservers don't necessarily get much traffic.  Especially early in a run
 		}
 
 		expectedFiles := [][]string{
 			{pluginOutputDir, "audit_logs", "kube-apiserver.audit_logs_listing"},
 			{pluginOutputDir, "audit_logs", "openshift-apiserver.audit_logs_listing"},
+			{pluginOutputDir, "audit_logs", "oauth-apiserver.audit_logs_listing"},
 		}
 
 		// for some crazy reason, it seems that the files from must-gather take time to appear on disk for reading.  I don't understand why
@@ -200,12 +201,18 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 						return nil
 					}
 
-					if (strings.Contains(path, "-termination-") && strings.HasSuffix(path, ".log.gz")) || strings.HasSuffix(path, "termination.log.gz") {
+					fileName := filepath.Base(path)
+					if (strings.Contains(fileName, "-termination-") && strings.HasSuffix(fileName, ".log.gz")) ||
+						strings.HasSuffix(fileName, "termination.log.gz") ||
+						(strings.Contains(fileName, "-startup-") && strings.HasSuffix(fileName, ".log.gz")) ||
+						strings.HasSuffix(fileName, "startup.log.gz") ||
+						fileName == ".lock" ||
+						fileName == "lock.log" {
 						// these are expected, but have unstructured log format
 						return nil
 					}
 
-					isAuditFile := (strings.Contains(path, "-audit-") && strings.HasSuffix(path, ".log.gz")) || strings.HasSuffix(path, "audit.log.gz")
+					isAuditFile := (strings.Contains(fileName, "-audit-") && strings.HasSuffix(fileName, ".log.gz")) || strings.HasSuffix(fileName, "audit.log.gz")
 					o.Expect(isAuditFile).To(o.BeTrue())
 
 					// at this point, we expect only audit files with json events, one per line
@@ -241,7 +248,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 						// - if on 4.6 but not upgraded => disable check
 						// - if on 4.6 and we have been upgraded from older release => keep the check.
 						if upgradedFrom45 {
-							for _, token := range []string{"oauthaccesstokens", "oauthauthorizetokens", tokenName} {
+							for _, token := range []string{"oauthaccesstokens", "oauthauthorizetokens", sha256TokenName} {
 								o.Expect(text).NotTo(o.ContainSubstring(token))
 							}
 						}
@@ -277,7 +284,7 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 			o.Expect(expectedFilePath).To(o.BeAnExistingFile())
 			stat, err := os.Stat(expectedFilePath)
 			o.Expect(err).NotTo(o.HaveOccurred())
-			if size := stat.Size(); size < 50 {
+			if size := stat.Size(); size < 20 {
 				emptyFiles = append(emptyFiles, expectedFilePath)
 			}
 		}
@@ -285,18 +292,84 @@ var _ = g.Describe("[sig-cli] oc adm must-gather", func() {
 			o.Expect(fmt.Errorf("expected files should not be empty: %s", strings.Join(emptyFiles, ","))).NotTo(o.HaveOccurred())
 		}
 	})
+
+	g.When("looking at the audit logs", func() {
+		g.Describe("[sig-node] kubelet", func() {
+			g.It("runs apiserver processes strictly sequentially in order to not risk audit log corruption", func() {
+				// On IBM ROKS, events will not be part of the output, since audit logs do not include control plane logs.
+				if e2e.TestContext.Provider == ibmcloud.ProviderName {
+					g.Skip("ROKs doesn't have audit logs")
+				}
+
+				tempDir, err := ioutil.TempDir("", "test.oc-adm-must-gather.")
+				o.Expect(err).NotTo(o.HaveOccurred())
+				defer os.RemoveAll(tempDir)
+
+				args := []string{
+					"--dest-dir", tempDir,
+					"--",
+					"/usr/bin/gather_audit_logs",
+				}
+
+				o.Expect(oc.Run("adm", "must-gather").Args(args...).Execute()).To(o.Succeed())
+
+				pluginOutputDir := getPluginOutputDir(tempDir)
+				expectedAuditSubDirs := []string{"kube-apiserver", "openshift-apiserver", "oauth-apiserver"}
+
+				seen := sets.String{}
+				for _, apiserver := range expectedAuditSubDirs {
+					err := filepath.Walk(filepath.Join(pluginOutputDir, "audit_logs", apiserver), func(path string, info os.FileInfo, err error) error {
+						g.By(path)
+						o.Expect(err).NotTo(o.HaveOccurred())
+						if info.IsDir() {
+							return nil
+						}
+
+						seen.Insert(apiserver)
+
+						if filepath.Base(path) != "lock.log" {
+							return nil
+						}
+
+						lockLog, err := ioutil.ReadFile(path)
+						o.Expect(err).NotTo(o.HaveOccurred())
+
+						// TODO: turn this into a failure as soon as kubelet is fixed
+						result.Flakef("kubelet launched %s without waiting for the old process to terminate (lock was still hold): \n\n%s", apiserver, string(lockLog))
+						return nil
+					})
+					o.Expect(err).NotTo(o.HaveOccurred())
+				}
+
+				o.Expect(seen.HasAll(expectedAuditSubDirs...), o.BeTrue())
+			})
+		})
+	})
 })
 
-func getPluginOutputDir(oc *exutil.CLI, tempDir string) string {
-	imageClient := versioned.NewForConfigOrDie(oc.AdminConfig())
-	stream, err := imageClient.ImageV1().ImageStreams("openshift").Get(context.Background(), "must-gather", metav1.GetOptions{})
+// getPluginOutputDir returns the directory containing must-gather assets.
+// Before [1], the assets were placed directly in tempDir.  Since [1],
+// they have been placed in a subdirectory named after the must-gather
+// image.
+//
+// [1]: https://github.com/openshift/oc/pull/84
+func getPluginOutputDir(tempDir string) string {
+	files, err := os.ReadDir(tempDir)
 	o.Expect(err).NotTo(o.HaveOccurred())
-	imageId, ok := imageutil.ResolveLatestTaggedImage(stream, "latest")
-	o.Expect(ok).To(o.BeTrue())
-	pluginOutputDir := path.Join(tempDir, regexp.MustCompile("[^A-Za-z0-9]+").ReplaceAllString(imageId, "-"))
-	fileInfo, err := os.Stat(pluginOutputDir)
-	if err != nil || !fileInfo.IsDir() {
-		pluginOutputDir = tempDir
+	dir := ""
+	for _, file := range files {
+		if file.IsDir() {
+			if dir != "" {
+				e2e.Logf("found multiple directories in %q, so assuming it is an old-style must-gather", tempDir)
+				return tempDir
+			}
+			dir = path.Join(tempDir, file.Name())
+		}
 	}
-	return pluginOutputDir
+	if dir == "" {
+		e2e.Logf("found no directories in %q, so assuming it is an old-style must-gather", tempDir)
+		return tempDir
+	}
+	e2e.Logf("found a single subdirectory %q, so assuming it is a new-style must-gather", dir)
+	return dir
 }

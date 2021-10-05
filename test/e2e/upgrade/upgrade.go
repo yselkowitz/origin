@@ -22,7 +22,8 @@ import (
 	"k8s.io/client-go/util/retry"
 	"k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/upgrades"
-	apps "k8s.io/kubernetes/test/e2e/upgrades/apps"
+	"k8s.io/kubernetes/test/e2e/upgrades/apps"
+	"k8s.io/kubernetes/test/e2e/upgrades/node"
 
 	g "github.com/onsi/ginkgo"
 	"github.com/pborman/uuid"
@@ -30,7 +31,9 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	configv1client "github.com/openshift/client-go/config/clientset/versioned"
 	"github.com/openshift/origin/test/e2e/upgrade/alert"
+	"github.com/openshift/origin/test/e2e/upgrade/manifestdelete"
 	"github.com/openshift/origin/test/e2e/upgrade/service"
+	"github.com/openshift/origin/test/extended/prometheus"
 	"github.com/openshift/origin/test/extended/util/disruption"
 	"github.com/openshift/origin/test/extended/util/disruption/controlplane"
 	"github.com/openshift/origin/test/extended/util/disruption/frontends"
@@ -38,6 +41,12 @@ import (
 	"github.com/openshift/origin/test/extended/util/operator"
 )
 
+// NoTests is an empty list of tests
+func NoTests() []upgrades.Test {
+	return []upgrades.Test{}
+}
+
+// AllTests includes all tests (minimal + disruption)
 func AllTests() []upgrades.Test {
 	return []upgrades.Test{
 		controlplane.NewKubeAvailableWithNewConnectionsTest(),
@@ -46,17 +55,22 @@ func AllTests() []upgrades.Test {
 		controlplane.NewKubeAvailableWithConnectionReuseTest(),
 		controlplane.NewOpenShiftAvailableWithConnectionReuseTest(),
 		controlplane.NewOAuthAvailableWithConnectionReuseTest(),
+		&manifestdelete.UpgradeTest{},
 		&alert.UpgradeTest{},
-		&frontends.AvailableTest{},
+		frontends.NewOAuthRouteAvailableWithNewConnectionsTest(),
+		frontends.NewOAuthRouteAvailableWithConnectionReuseTest(),
+		frontends.NewConsoleRouteAvailableWithNewConnectionsTest(),
+		frontends.NewConsoleRouteAvailableWithConnectionReuseTest(),
 		&service.UpgradeTest{},
-		&upgrades.SecretUpgradeTest{},
+		&node.SecretUpgradeTest{},
 		&apps.ReplicaSetUpgradeTest{},
 		&apps.StatefulSetUpgradeTest{},
 		&apps.DeploymentUpgradeTest{},
 		&apps.JobUpgradeTest{},
-		&upgrades.ConfigMapUpgradeTest{},
+		&node.ConfigMapUpgradeTest{},
 		&apps.DaemonSetUpgradeTest{},
 		&imageregistry.AvailableTest{},
+		&prometheus.MetricsAvailableAfterUpgradeTest{},
 	}
 }
 
@@ -227,7 +241,7 @@ func getUpgradeContext(c configv1client.Interface, upgradeImage string) (*upgrad
 
 	upgradeImages := strings.Split(upgradeImage, ",")
 	if (len(upgradeImages[0]) > 0 && upgradeImages[0] == current.Image) || (len(upgradeImages[0]) > 0 && upgradeImages[0] == current.Version) {
-		return nil, fmt.Errorf("cluster is already at version %s", versionString(*current))
+		framework.Logf("cluster is already at version %s", versionString(*current))
 	}
 	for _, upgradeImage := range upgradeImages {
 		var next upgrades.VersionContext
@@ -263,8 +277,29 @@ func clusterUpgrade(f *framework.Framework, c configv1client.Interface, dc dynam
 
 	// this is very long.  We should update the clusteroperator junit to give us a duration.
 	maximumDuration := 150 * time.Minute
-	// if upgrades take longer than this, then we will have a junit marker indicating failure.
-	durationToSoftFailure := 75 * time.Minute
+	baseDurationToSoftFailure := 75 * time.Minute
+	durationToSoftFailure := baseDurationToSoftFailure
+
+	infra, err := c.ConfigV1().Infrastructures().Get(context.Background(), "cluster", metav1.GetOptions{})
+	framework.ExpectNoError(err)
+	if infra.Status.PlatformStatus.Type == configv1.AWSPlatformType {
+		// due to https://bugzilla.redhat.com/show_bug.cgi?id=1943804 upgrades take ~12 extra minutes on AWS
+		// and see commit d69db34a816f3ce8a9ab567621d145c5cd2d257f which notes that some AWS upgrades can
+		// take close to 105 minutes total (75 is base duration, so adding 30 more if it's AWS)
+		durationToSoftFailure = baseDurationToSoftFailure + (30 * time.Minute)
+	} else {
+		// if the cluster is on AWS we've already bumped the timeout enough, but if not we need to check if
+		// the CNI is OVN and increase our timeout for that
+		network, err := c.ConfigV1().Networks().Get(context.Background(), "cluster", metav1.GetOptions{})
+		framework.ExpectNoError(err)
+		if network.Status.NetworkType == "OVNKubernetes" {
+			// deploying with OVN is expected to take longer. on average, ~15m longer
+			// some extra context to this increase which links to a jira showing which operators take longer:
+			// compared to OpenShiftSDN:
+			//   https://bugzilla.redhat.com/show_bug.cgi?id=1942164
+			durationToSoftFailure = baseDurationToSoftFailure + (15 * time.Minute)
+		}
+	}
 
 	framework.Logf("Starting upgrade to version=%s image=%s attempt=%s", version.Version.String(), version.NodeImage, uid)
 	recordClusterEvent(kubeClient, uid, "Upgrade", "UpgradeStarted", fmt.Sprintf("version/%s image/%s", version.Version.String(), version.NodeImage), false)
@@ -409,11 +444,12 @@ func clusterUpgrade(f *framework.Framework, c configv1client.Interface, dc dynam
 			// record whether the cluster was fast or slow upgrading.  Don't fail the test, we still want signal on the actual tests themselves.
 			upgradeEnded := time.Now()
 			upgradeDuration := upgradeEnded.Sub(upgradeStarted)
+			testCaseName := fmt.Sprintf("[sig-cluster-lifecycle] cluster upgrade should complete in %0.2f minutes", durationToSoftFailure.Minutes())
+			failure := ""
 			if upgradeDuration > durationToSoftFailure {
-				disruption.RecordJUnitResult(f, "[sig-cluster-lifecycle] cluster upgrade should be fast", upgradeDuration, fmt.Sprintf("%s to %s took too long: %v", action, versionString(desired), upgradeDuration.Minutes()))
-			} else {
-				disruption.RecordJUnitResult(f, "[sig-cluster-lifecycle] cluster upgrade should be fast", upgradeDuration, "")
+				failure = fmt.Sprintf("%s to %s took too long: %0.2f minutes", action, versionString(desired), upgradeDuration.Minutes())
 			}
+			disruption.RecordJUnitResult(f, testCaseName, upgradeDuration, failure)
 
 			return nil
 		},

@@ -23,11 +23,11 @@ metadata:
 spec:
   runPolicy: Serial
   source:
+    type: Dockerfile
     dockerfile: |-
       FROM %s
-      RUN chmod -R uga+rwx /run
+      RUN chmod -R uga+rwx /run/secrets
       USER 1001
-  type: Dockerfile
   strategy:
     dockerStrategy:
       env:
@@ -35,7 +35,7 @@ spec:
           value: "10"
       imageOptimizationPolicy: SkipLayers
     type: Docker
-`, image.ShellImage())
+`, image.LimitedShellImage())
 		testVerifyRunFSContentsBuildConfigYaml = fmt.Sprintf(`
 apiVersion: build.openshift.io/v1
 kind: BuildConfig
@@ -44,11 +44,11 @@ metadata:
 spec:
   runPolicy: Serial
   source:
+    type: Dockerfile
     dockerfile: |-
       FROM %s
-      RUN ls -R /run
+      RUN ls -R /run/secrets
       USER 1001
-  type: Dockerfile
   strategy:
     dockerStrategy:
       env:
@@ -56,17 +56,8 @@ spec:
           value: "10"
       imageOptimizationPolicy: SkipLayers
     type: Docker
-`, image.ShellImage())
+`, image.LimitedShellImage())
 		lsRSlashRun = `
-/run:
-lock
-rhsm
-secrets
-
-/run/lock:
-
-/run/rhsm:
-
 /run/secrets:
 rhsm
 
@@ -78,40 +69,13 @@ redhat-entitlement-authority.pem
 redhat-uep.pem
 `
 		lsRSlashRunFIPS = `
-/run:
-lock
-rhsm
-secrets
-
-/run/lock:
-
-/run/rhsm:
-
 /run/secrets:
 system-fips
 `
 		lsRSlashRunOKD = `
-/run:
-lock
-rhsm
-secrets
-
-/run/lock:
-
-/run/rhsm:
-
 /run/secrets:
 `
 		lsRSlashRunRhel7 = `
-/run:
-lock
-rhsm
-secrets
-
-/run/lock:
-
-/run/rhsm:
-
 /run/secrets:
 rhsm
 
@@ -153,7 +117,7 @@ valid_fields.json
 				o.Expect(err).NotTo(o.HaveOccurred())
 				br.AssertSuccess()
 
-				g.By("check build logs for ls -R /run")
+				g.By("check build logs for ls -R /run/secrets")
 				logs, err := br.LogsNoTimestamp()
 				o.Expect(err).NotTo(o.HaveOccurred())
 				hasRightListing := false

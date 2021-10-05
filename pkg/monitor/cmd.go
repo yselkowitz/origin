@@ -38,7 +38,11 @@ func (opt *Options) Run() error {
 	}()
 	signal.Notify(abortCh, syscall.SIGINT, syscall.SIGTERM)
 
-	m, err := Start(ctx)
+	restConfig, err := GetMonitorRESTConfig()
+	if err != nil {
+		return err
+	}
+	m, err := Start(ctx, restConfig)
 	if err != nil {
 		return err
 	}
@@ -54,7 +58,7 @@ func (opt *Options) Run() error {
 			case <-ctx.Done():
 				done = true
 			}
-			events := m.Events(last, time.Time{})
+			events := m.Intervals(last, time.Time{})
 			if len(events) > 0 {
 				for _, event := range events {
 					if !event.From.Equal(event.To) {

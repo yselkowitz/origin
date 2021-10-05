@@ -31,8 +31,8 @@ import (
 	"time"
 
 	jsonpatch "github.com/evanphx/json-patch"
-	"github.com/go-openapi/spec"
 	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/trace"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -58,6 +58,7 @@ import (
 	apiopenapi "k8s.io/apiserver/pkg/endpoints/openapi"
 	apirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/features"
+	genericfeatures "k8s.io/apiserver/pkg/features"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/server/dynamiccertificates"
 	"k8s.io/apiserver/pkg/server/egressselector"
@@ -67,7 +68,9 @@ import (
 	serverstore "k8s.io/apiserver/pkg/server/storage"
 	"k8s.io/apiserver/pkg/storageversion"
 	"k8s.io/apiserver/pkg/util/feature"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	utilflowcontrol "k8s.io/apiserver/pkg/util/flowcontrol"
+	flowcontrolrequest "k8s.io/apiserver/pkg/util/flowcontrol/request"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
@@ -75,6 +78,7 @@ import (
 	"k8s.io/component-base/logs"
 	"k8s.io/klog/v2"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 	utilsnet "k8s.io/utils/net"
 
 	// install apis
@@ -117,7 +121,7 @@ type Config struct {
 	// to set values and determine whether its allowed
 	AdmissionControl      admission.Interface
 	CorsAllowedOriginList []string
-
+	HSTSDirectives        []string
 	// FlowControl, if not nil, gives priority and fairness to request handling
 	FlowControl utilflowcontrol.Interface
 
@@ -141,6 +145,9 @@ type Config struct {
 	// ExternalAddress is the host name to use for external (public internet) facing URLs (e.g. Swagger)
 	// Will default to a value based on secure serving info and available ipv4 IPs.
 	ExternalAddress string
+
+	// TracerProvider can provide a tracer, which records spans for distributed tracing.
+	TracerProvider *trace.TracerProvider
 
 	//===========================================================================
 	// Fields you probably don't care about changing
@@ -170,6 +177,8 @@ type Config struct {
 	Serializer runtime.NegotiatedSerializer
 	// OpenAPIConfig will be used in generating OpenAPI spec. This is nil by default. Use DefaultOpenAPIConfig for "working" defaults.
 	OpenAPIConfig *openapicommon.Config
+	// SkipOpenAPIInstallation avoids installing the OpenAPI handler if set to true.
+	SkipOpenAPIInstallation bool
 
 	// RESTOptionsGetter is used to construct RESTStorage types via the generic registry.
 	RESTOptionsGetter genericregistry.RESTOptionsGetter
@@ -218,8 +227,25 @@ type Config struct {
 	// If not specify any in flags, then genericapiserver will only enable defaultAPIResourceConfig.
 	MergedResourceConfig *serverstore.ResourceConfig
 
+	// RequestWidthEstimator is used to estimate the "width" of the incoming request(s).
+	RequestWidthEstimator flowcontrolrequest.WidthEstimatorFunc
+
+	// lifecycleSignals provides access to the various signals
+	// that happen during lifecycle of the apiserver.
+	// it's intentionally marked private as it should never be overridden.
+	lifecycleSignals lifecycleSignals
+
 	// EventSink receives events about the life cycle of the API server, e.g. readiness, serving, signals and termination.
 	EventSink EventSink
+
+	// ShutdownSendRetryAfter dictates when to initiate shutdown of the HTTP
+	// Server during the graceful termination of the apiserver. If true, we wait
+	// for non longrunning requests in flight to be drained and then initiate a
+	// shutdown of the HTTP Server. If false, we initiate a shutdown of the HTTP
+	// Server as soon as ShutdownDelayDuration has elapsed.
+	// If enabled, after ShutdownDelayDuration elapses, any incoming request is
+	// rejected with a 429 status code and a 'Retry-After' response.
+	ShutdownSendRetryAfter bool
 
 	//===========================================================================
 	// values below here are targets for removal
@@ -239,12 +265,6 @@ type Config struct {
 
 	// StorageVersionManager holds the storage versions of the API resources installed by this server.
 	StorageVersionManager storageversion.Manager
-
-	// hasBeenReadyCh is closed when /readyz succeeds for the first time.
-	hasBeenReadyCh chan struct{}
-
-	// A func that returns whether the server is terminating. This can be nil.
-	IsTerminating func() bool
 }
 
 // EventSink allows to create events.
@@ -355,10 +375,11 @@ func NewConfig(codecs serializer.CodecFactory) *Config {
 		// Default to treating watch as a long-running operation
 		// Generic API servers have no inherent long-running subresources
 		LongRunningFunc:       genericfilters.BasicLongRunningRequestCheck(sets.NewString("watch"), sets.NewString()),
+		RequestWidthEstimator: flowcontrolrequest.DefaultWidthEstimator,
+		lifecycleSignals:      newLifecycleSignals(),
+
 		APIServerID:           id,
 		StorageVersionManager: storageversion.NewDefaultManager(),
-
-		hasBeenReadyCh: make(chan struct{}),
 	}
 }
 
@@ -460,6 +481,11 @@ func (c *Config) AddPostStartHookOrDie(name string, hook PostStartHookFunc) {
 	if err := c.AddPostStartHook(name, hook); err != nil {
 		klog.Fatalf("Error registering PostStartHook %q: %v", name, err)
 	}
+}
+
+// HasBeenReadySignal exposes a server's lifecycle signal which is signaled when the readyz endpoint succeeds for the first time.
+func (c *Config) HasBeenReadySignal() <-chan struct{} {
+	return c.lifecycleSignals.HasBeenReady.Signaled()
 }
 
 // Complete fills in any fields not set that are required to have valid data and can be derived
@@ -586,7 +612,7 @@ func eventReference() (*corev1.ObjectReference, error) {
 	}
 	if len(ns) == 0 {
 		pod = ""
-		ns = "kube-system"
+		ns = "openshift-kube-apiserver"
 	}
 	if len(pod) == 0 {
 		return &corev1.ObjectReference{
@@ -605,7 +631,7 @@ func eventReference() (*corev1.ObjectReference, error) {
 }
 
 // New creates a new server which logically combines the handling chain with the passed server.
-// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delgating.
+// name is used to differentiate for logging. The handler chain in particular can be difficult as it starts delegating.
 // delegationTarget may not be nil.
 func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*GenericAPIServer, error) {
 	if c.Serializer == nil {
@@ -645,7 +671,8 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 
 		listedPathProvider: apiServerHandler,
 
-		openAPIConfig: c.OpenAPIConfig,
+		openAPIConfig:           c.OpenAPIConfig,
+		skipOpenAPIInstallation: c.SkipOpenAPIInstallation,
 
 		postStartHooks:         map[string]postStartHookEntry{},
 		preShutdownHooks:       map[string]preShutdownHookEntry{},
@@ -654,8 +681,6 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		healthzChecks:    c.HealthzChecks,
 		livezChecks:      c.LivezChecks,
 		readyzChecks:     c.ReadyzChecks,
-		readinessStopCh:  make(chan struct{}),
-		hasBeenReadyCh:   c.hasBeenReadyCh,
 		livezGracePeriod: c.LivezGracePeriod,
 
 		DiscoveryGroupManager: discovery.NewRootAPIsHandler(c.DiscoveryAddresses, c.Serializer),
@@ -663,8 +688,13 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 		maxRequestBodyBytes: c.MaxRequestBodyBytes,
 		livezClock:          clock.RealClock{},
 
+		lifecycleSignals:       c.lifecycleSignals,
+		ShutdownSendRetryAfter: c.ShutdownSendRetryAfter,
+
 		APIServerID:           c.APIServerID,
 		StorageVersionManager: c.StorageVersionManager,
+
+		Version: c.Version,
 
 		eventSink: c.EventSink,
 	}
@@ -717,7 +747,7 @@ func (c completedConfig) New(name string, delegationTarget DelegationTarget) (*G
 			}
 		}
 		// TODO: Once we get rid of /healthz consider changing this to post-start-hook.
-		err := s.addReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
+		err := s.AddReadyzChecks(healthz.NewInformerSyncHealthz(c.SharedInformerFactory))
 		if err != nil {
 			return nil, err
 		}
@@ -807,7 +837,7 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 
 	if c.FlowControl != nil {
 		handler = filterlatency.TrackCompleted(handler)
-		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl)
+		handler = genericfilters.WithPriorityAndFairness(handler, c.LongRunningFunc, c.FlowControl, c.RequestWidthEstimator)
 		handler = filterlatency.TrackStarted(handler, "priorityandfairness")
 	} else {
 		handler = genericfilters.WithMaxInFlightLimit(handler, c.MaxRequestsInFlight, c.MaxMutatingRequestsInFlight, c.LongRunningFunc)
@@ -838,17 +868,27 @@ func DefaultBuildHandlerChain(apiHandler http.Handler, c *Config) http.Handler {
 	handler = genericapifilters.WithRequestDeadline(handler, c.AuditBackend, c.AuditPolicyChecker,
 		c.LongRunningFunc, c.Serializer, c.RequestTimeout)
 	handler = genericfilters.WithWaitGroup(handler, c.LongRunningFunc, c.HandlerChainWaitGroup)
-	handler = WithNonReadyRequestLogging(handler, c.hasBeenReadyCh)
+	handler = WithNonReadyRequestLogging(handler, c.lifecycleSignals.HasBeenReady)
 	handler = WithLateConnectionFilter(handler)
-	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 	if c.SecureServing != nil && !c.SecureServing.DisableHTTP2 && c.GoawayChance > 0 {
 		handler = genericfilters.WithProbabilisticGoaway(handler, c.GoawayChance)
 	}
 	handler = genericapifilters.WithAuditAnnotations(handler, c.AuditBackend, c.AuditPolicyChecker)
 	handler = genericapifilters.WithWarningRecorder(handler)
 	handler = genericapifilters.WithCacheControl(handler)
+	handler = genericfilters.WithHSTS(handler, c.HSTSDirectives)
+	if c.ShutdownSendRetryAfter {
+		handler = genericfilters.WithRetryAfter(handler, c.lifecycleSignals.AfterShutdownDelayDuration.Signaled())
+	}
+	handler = genericfilters.WithOptInRetryAfter(handler, c.newServerFullyInitializedFunc())
+	handler = genericfilters.WithHTTPLogging(handler, c.newIsTerminatingFunc())
+	if utilfeature.DefaultFeatureGate.Enabled(genericfeatures.APIServerTracing) {
+		handler = genericapifilters.WithTracing(handler, c.TracerProvider)
+	}
+	handler = genericapifilters.WithRequestInfo(handler, c.RequestInfoResolver)
 	handler = genericapifilters.WithRequestReceivedTimestamp(handler)
-	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver, c.IsTerminating)
+	handler = genericfilters.WithPanicRecovery(handler, c.RequestInfoResolver)
+	handler = genericapifilters.WithAuditID(handler)
 	return handler
 }
 
@@ -938,7 +978,7 @@ func AuthorizeClientBearerToken(loopback *restclient.Config, authn *Authenticati
 		Groups: []string{user.SystemPrivilegedGroup},
 	}
 
-	tokenAuthenticator := authenticatorfactory.NewFromTokens(tokens)
+	tokenAuthenticator := authenticatorfactory.NewFromTokens(tokens, authn.APIAudiences)
 	authn.Authenticator = authenticatorunion.New(tokenAuthenticator, authn.Authenticator)
 
 	if !skipSystemMastersAuthorizer {

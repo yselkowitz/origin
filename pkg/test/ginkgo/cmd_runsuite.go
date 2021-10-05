@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"io/ioutil"
 	"os"
 	"os/signal"
@@ -14,10 +15,22 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/openshift/origin/pkg/monitor"
-	"k8s.io/apimachinery/pkg/util/sets"
+	"github.com/openshift/origin/test/extended/testdata"
 
 	"github.com/onsi/ginkgo/config"
+	"github.com/openshift/origin/pkg/monitor"
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+	monitorserialization "github.com/openshift/origin/pkg/monitor/serialization"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+const (
+	// Dump pod displacements with at least 3 instances
+	minChainLen = 3
+
+	setupEvent       = "Setup"
+	upgradeEvent     = "Upgrade"
+	postUpgradeEvent = "PostUpgrade"
 )
 
 // Options is used to run a suite of tests by invoking each test
@@ -210,32 +223,53 @@ func (opt *Options) Run(suite *TestSuite) error {
 	}()
 	signal.Notify(abortCh, syscall.SIGINT, syscall.SIGTERM)
 
-	m, err := monitor.Start(ctx)
+	restConfig, err := monitor.GetMonitorRESTConfig()
 	if err != nil {
 		return err
 	}
+	m, err := monitor.Start(ctx, restConfig)
+	if err != nil {
+		return err
+	}
+
+	pc, err := SetupNewPodCollector(ctx)
+	if err != nil {
+		return err
+	}
+
+	pc.SetEvents([]string{setupEvent})
+	pc.Run(ctx)
+
 	// if we run a single test, always include success output
 	includeSuccess := opt.IncludeSuccessOutput
 	if len(tests) == 1 && count == 1 {
 		includeSuccess = true
 	}
 
-	early, normal := splitTests(tests, func(t *testCase) bool {
+	early, others := splitTests(tests, func(t *testCase) bool {
 		return strings.Contains(t.name, "[Early]")
 	})
 
-	late, normal := splitTests(normal, func(t *testCase) bool {
+	late, others := splitTests(others, func(t *testCase) bool {
 		return strings.Contains(t.name, "[Late]")
 	})
 
+	kubeTests, openshiftTests := splitTests(others, func(t *testCase) bool {
+		return strings.Contains(t.name, "[Suite:k8s]")
+	})
+
+	// If user specifies a count, duplicate the kube and openshift tests that many times.
 	expectedTestCount := len(early) + len(late)
 	if count != -1 {
-		original := normal
+		originalKube := kubeTests
+		originalOpenshift := openshiftTests
+
 		for i := 1; i < count; i++ {
-			normal = append(normal, copyTests(original)...)
+			kubeTests = append(kubeTests, copyTests(originalKube)...)
+			openshiftTests = append(openshiftTests, copyTests(originalOpenshift)...)
 		}
 	}
-	expectedTestCount += len(normal)
+	expectedTestCount += len(openshiftTests) + len(kubeTests)
 
 	status := newTestStatus(opt.Out, includeSuccess, expectedTestCount, timeout, m, m, opt.AsEnv())
 	testCtx := ctx
@@ -256,21 +290,50 @@ func (opt *Options) Run(suite *TestSuite) error {
 	q.Execute(testCtx, early, parallelism, status.Run)
 	tests = append(tests, early...)
 
-	// repeat the normal suite until context cancel when in the forever loop
+	// TODO: will move to the monitor
+	pc.SetEvents([]string{upgradeEvent})
+
+	// Run kube & openshift tests. If user specified a count of -1,
+	// we loop indefinitely.
 	for i := 0; (i < 1 || count == -1) && testCtx.Err() == nil; i++ {
-		copied := copyTests(normal)
-		q.Execute(testCtx, copied, parallelism, status.Run)
-		tests = append(tests, copied...)
+		kubeTestsCopy := copyTests(kubeTests)
+		q.Execute(testCtx, kubeTestsCopy, parallelism, status.Run)
+		tests = append(tests, kubeTestsCopy...)
+
+		openshiftTestsCopy := copyTests(openshiftTests)
+		q.Execute(testCtx, openshiftTestsCopy, parallelism, status.Run)
+		tests = append(tests, openshiftTestsCopy...)
 	}
+
+	// TODO: will move to the monitor
+	pc.SetEvents([]string{postUpgradeEvent})
 
 	// run Late test suits after everything else
 	q.Execute(testCtx, late, parallelism, status.Run)
 	tests = append(tests, late...)
 
+	// TODO: will move to the monitor
+	if len(opt.JUnitDir) > 0 {
+		pc.ComputePodTransitions()
+		data, err := pc.JsonDump()
+		if err != nil {
+			fmt.Fprintf(opt.ErrOut, "Unable to dump pod placement data: %v\n", err)
+		} else {
+			if err := ioutil.WriteFile(filepath.Join(opt.JUnitDir, "pod-placement-data.json"), data, 0644); err != nil {
+				fmt.Fprintf(opt.ErrOut, "Unable to write pod placement data: %v\n", err)
+			}
+		}
+		chains := pc.PodDisplacements().Dump(minChainLen)
+		if err := ioutil.WriteFile(filepath.Join(opt.JUnitDir, "pod-transitions.txt"), []byte(chains), 0644); err != nil {
+			fmt.Fprintf(opt.ErrOut, "Unable to write pod placement data: %v\n", err)
+		}
+	}
+
 	// calculate the effective test set we ran, excluding any incompletes
 	tests, _ = splitTests(tests, func(t *testCase) bool { return t.success || t.failed || t.skipped })
 
-	duration := time.Now().Sub(start).Round(time.Second / 10)
+	end := time.Now()
+	duration := end.Sub(start).Round(time.Second / 10)
 	if duration > time.Minute {
 		duration = duration.Round(time.Second)
 	}
@@ -280,12 +343,64 @@ func (opt *Options) Run(suite *TestSuite) error {
 	// monitor the cluster while the tests are running and report any detected anomalies
 	var syntheticTestResults []*JUnitTestCase
 	var syntheticFailure bool
-	if events := m.Events(time.Time{}, time.Time{}); len(events) > 0 {
-		eventsForTests := createEventsForTests(tests)
+	timeSuffix := fmt.Sprintf("_%s", start.UTC().Format("20060102-150405"))
+	events := m.Intervals(time.Time{}, time.Time{})
 
+	if len(opt.JUnitDir) > 0 {
+		var additionalEvents monitorapi.Intervals
+		filepath.WalkDir(opt.JUnitDir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return nil
+			}
+			if d.IsDir() {
+				return nil
+			}
+			if !strings.HasPrefix(d.Name(), "AdditionalEvents_") {
+				return nil
+			}
+			saved, _ := monitorserialization.EventsFromFile(path)
+			additionalEvents = append(additionalEvents, saved...)
+			return nil
+		})
+		if len(additionalEvents) > 0 {
+			events = append(events, additionalEvents.Cut(start, end)...)
+			sort.Sort(events)
+		}
+	}
+	events.Clamp(start, end)
+
+	if len(opt.JUnitDir) > 0 {
+		if err = monitorserialization.EventsToFile(filepath.Join(opt.JUnitDir, fmt.Sprintf("e2e-events%s.json", timeSuffix)), events); err != nil {
+			fmt.Fprintf(opt.ErrOut, "error: Failed to write event html: %v\n", err)
+		}
+		if err = monitorserialization.EventsIntervalsToFile(filepath.Join(opt.JUnitDir, fmt.Sprintf("e2e-intervals%s.json", timeSuffix)), events); err != nil {
+			fmt.Fprintf(opt.ErrOut, "error: Failed to write event html: %v\n", err)
+		}
+		if eventIntervalsJSON, err := monitorserialization.EventsIntervalsToJSON(events); err == nil {
+			e2eChartTemplate := testdata.MustAsset("e2echart/e2e-chart-template.html")
+			e2eChartHTML := bytes.ReplaceAll(e2eChartTemplate, []byte("EVENT_INTERVAL_JSON_GOES_HERE"), eventIntervalsJSON)
+			e2eChartHTMLPath := filepath.Join(opt.JUnitDir, fmt.Sprintf("e2e-intervals%s.html", timeSuffix))
+			if err := ioutil.WriteFile(e2eChartHTMLPath, e2eChartHTML, 0644); err != nil {
+				fmt.Fprintf(opt.ErrOut, "error: Failed to write event html: %v\n", err)
+			}
+		} else {
+			fmt.Fprintf(opt.ErrOut, "error: Failed to write event html: %v\n", err)
+		}
+
+		// write out the current state of resources that we explicitly tracked.
+		resourcesMap := m.CurrentResourceState()
+		for resourceType, instanceMap := range resourcesMap {
+			targetFile := fmt.Sprintf("resource-%s%s.zip", resourceType, timeSuffix)
+			if err = monitorserialization.InstanceMapToFile(filepath.Join(opt.JUnitDir, targetFile), resourceType, instanceMap); err != nil {
+				fmt.Fprintf(opt.ErrOut, "error: Failed to write %q: %v\n", targetFile, err)
+			}
+		}
+	}
+
+	if len(events) > 0 {
 		var buf *bytes.Buffer
-		syntheticTestResults, buf, _ = createSyntheticTestsFromMonitor(m, eventsForTests, duration)
-		testCases := syntheticEventTests.JUnitsForEvents(events, duration)
+		syntheticTestResults, buf, _ = createSyntheticTestsFromMonitor(events, duration)
+		testCases := syntheticEventTests.JUnitsForEvents(events, duration, restConfig)
 		syntheticTestResults = append(syntheticTestResults, testCases...)
 
 		if len(syntheticTestResults) > 0 {

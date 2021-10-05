@@ -9,27 +9,19 @@ var (
 	TestMaps = map[string][]string{
 		// alpha features that are not gated
 		"[Disabled:Alpha]": {
-			// ALPHA features in 1.20, disabled by default.
-			// !!! Review their status as part of the 1.21 rebase.
-			`\[Feature:CSIStorageCapacity\]`,
-			`\[Feature:CSIServiceAccountToken\]`,
-			`\[Feature:IPv6DualStack.*\]`,
-			`\[Feature:TTLAfterFinished\]`,
-
-			// BETA features in 1.20, enabled by default
-			// Their enablement is tracked via bz's targeted at 4.6.
-			`\[Feature:SCTPConnectivity\]`, // https://bugzilla.redhat.com/show_bug.cgi?id=1861606
+			`\[Feature:StorageVersionAPI\]`,
+			`\[Feature:StatefulSetMinReadySeconds\]`,
+			`\[Feature:PodSecurityPolicy\]`,
 		},
 		// tests for features that are not implemented in openshift
 		"[Disabled:Unimplemented]": {
-			`\[Feature:Networking-IPv6\]`, // openshift-sdn doesn't support yet
-			`Monitoring`,                  // Not installed, should be
-			`Cluster level logging`,       // Not installed yet
-			`Kibana`,                      // Not installed
-			`Ubernetes`,                   // Can't set zone labels today
-			`kube-ui`,                     // Not installed by default
-			`Kubernetes Dashboard`,        // Not installed by default (also probably slow image pull)
-			`should proxy to cadvisor`,    // we don't expose cAdvisor port directly for security reasons
+			`Monitoring`,               // Not installed, should be
+			`Cluster level logging`,    // Not installed yet
+			`Kibana`,                   // Not installed
+			`Ubernetes`,                // Can't set zone labels today
+			`kube-ui`,                  // Not installed by default
+			`Kubernetes Dashboard`,     // Not installed by default (also probably slow image pull)
+			`should proxy to cadvisor`, // we don't expose cAdvisor port directly for security reasons
 		},
 		// tests that rely on special configuration that we do not yet support
 		"[Disabled:SpecialConfig]": {
@@ -59,7 +51,6 @@ var (
 			`unchanging, static URL paths for kubernetes api services`,  // the test needs to exclude URLs that are not part of conformance (/logs)
 			`Services should be able to up and down services`,           // we don't have wget installed on nodes
 			`KubeProxy should set TCP CLOSE_WAIT timeout`,               // the test require communication to port 11302 in the cluster nodes
-			`\[NodeFeature:Sysctls\]`,                                   // needs SCC support
 			`should check kube-proxy urls`,                              // previously this test was skipped b/c we reported -1 as the number of nodes, now we report proper number and test fails
 			`SSH`,                                                       // TRIAGE
 			`should implement service.kubernetes.io/service-proxy-name`, // this is an optional test that requires SSH. sig-network
@@ -77,9 +68,8 @@ var (
 			"should reject a Pod requesting a RuntimeClass with conflicting node selector",
 			"should run a Pod requesting a RuntimeClass with scheduling",
 
-			// NFS umount is broken in kernels 5.7+
-			// https://bugzilla.redhat.com/show_bug.cgi?id=1854379
-			`\[sig-storage\].*\[Driver: nfs\] \[Testpattern: Dynamic PV \(default fs\)\].*subPath should be able to unmount after the subpath directory is deleted`,
+			// A fix is in progress: https://github.com/openshift/origin/pull/24709
+			`Multi-AZ Clusters should spread the pods of a replication controller across zones`,
 
 			// Upstream assumes all control plane pods are in kube-system namespace and we should revert the change
 			// https://github.com/kubernetes/kubernetes/commit/176c8e219f4c7b4c15d34b92c50bfa5ba02b3aba#diff-28a3131f96324063dd53e17270d435a3b0b3bd8f806ee0e33295929570eab209R78
@@ -90,11 +80,43 @@ var (
 
 			// https://bugzilla.redhat.com/show_bug.cgi?id=1906808
 			`ServiceAccounts should support OIDC discovery of service account issuer`,
+
+			// NFS umount is broken in kernels 5.7+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1854379
+			`\[sig-storage\].*\[Driver: nfs\] \[Testpattern: Dynamic PV \(default fs\)\].*subPath should be able to unmount after the subpath directory is deleted`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1945329
+			`should drop INVALID conntrack entries`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1993845
+			`Services should respect internalTrafficPolicy=Local Pod to Pod \(hostNetwork: true\)`,
+			`Services should respect internalTrafficPolicy=Local Pod \(hostNetwork: true\) to Pod \(hostNetwork: true\)`,
+			`Services should respect internalTrafficPolicy=Local Pod \(hostNetwork: true\) to Pod`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1980141
+			`Netpol NetworkPolicy between server and client should enforce policy to allow traffic only from a pod in a different namespace based on PodSelector and NamespaceSelector`,
+			`Netpol NetworkPolicy between server and client should enforce policy to allow traffic from pods within server namespace based on PodSelector`,
+			`Netpol NetworkPolicy between server and client should enforce policy based on NamespaceSelector with MatchExpressions`,
+			`Netpol NetworkPolicy between server and client should enforce policy based on PodSelector with MatchExpressions`,
+			`Netpol NetworkPolicy between server and client should enforce policy based on PodSelector or NamespaceSelector`,
+			`Netpol NetworkPolicy between server and client should deny ingress from pods on other namespaces`,
+			`Netpol NetworkPolicy between server and client should enforce updated policy`,
+			`Netpol NetworkPolicy between server and client should enforce multiple, stacked policies with overlapping podSelectors`,
+			`Netpol NetworkPolicy between server and client should enforce policy based on any PodSelectors`,
+			`Netpol NetworkPolicy between server and client should enforce policy to allow traffic only from a different namespace, based on NamespaceSelector`,
+			`Netpol \[LinuxOnly\] NetworkPolicy between server and client using UDP should support a 'default-deny-ingress' policy`,
+			`Netpol \[LinuxOnly\] NetworkPolicy between server and client using UDP should enforce policy based on Ports`,
+			`Netpol \[LinuxOnly\] NetworkPolicy between server and client using UDP should enforce policy to allow traffic only from a pod in a different namespace based on PodSelector and NamespaceSelector`,
+			// Bug https://bugzilla.redhat.com/show_bug.cgi?id=1989180
+			`\[sig-storage\] Multi-AZ Cluster Volumes should schedule pods in the same zones as statically provisioned PVs`,
 		},
 		// tests that may work, but we don't support them
 		"[Disabled:Unsupported]": {
 			`\[Driver: rbd\]`,               // OpenShift 4.x does not support Ceph RBD (use CSI instead)
 			`\[Driver: ceph\]`,              // OpenShift 4.x does not support CephFS (use CSI instead)
+			`\[Driver: gluster\]`,           // OpenShift 4.x does not support Gluster
+			`Volumes GlusterFS`,             // OpenShift 4.x does not support Gluster
+			`GlusterDynamicProvisioner`,     // OpenShift 4.x does not support Gluster
 			`\[Feature:PodSecurityPolicy\]`, // OpenShift 4.x does not enable PSP by default
 		},
 		// tests too slow to be part of conformance
@@ -121,8 +143,6 @@ var (
 			`Clean up pods on node`,     // schedules up to max pods per node
 			`DynamicProvisioner should test that deleting a claim before the volume is provisioned deletes the volume`, // test is very disruptive to other tests
 
-			`Multi-AZ Clusters should spread the pods of a service across zones`, // spreading is a priority, not a predicate, and if the node is temporarily full the priority will be ignored
-
 			`Should be able to support the 1\.7 Sample API Server using the current Aggregator`, // down apiservices break other clients today https://bugzilla.redhat.com/show_bug.cgi?id=1623195
 
 			`\[Feature:HPA\] Horizontal pod autoscaling \(scale resource: CPU\) \[sig-autoscaling\] ReplicationController light Should scale from 1 pod to 2 pods`,
@@ -136,7 +156,7 @@ var (
 		},
 		"[Skipped:gce]": {
 			// Requires creation of a different compute instance in a different zone and is not compatible with volumeBindingMode of WaitForFirstConsumer which we use in 4.x
-			`\[sig-scheduling\] Multi-AZ Cluster Volumes \[sig-storage\] should only be allowed to provision PDs in zones where nodes exist`,
+			`\[sig-storage\] Multi-AZ Cluster Volumes should only be allowed to provision PDs in zones where nodes exist`,
 
 			// The following tests try to ssh directly to a node. None of our nodes have external IPs
 			`\[k8s.io\] \[sig-node\] crictl should be able to run crictl on the node`,
@@ -193,7 +213,8 @@ var (
 			`NetworkPolicy.*[Ee]gress`,  // feature is not supported by openshift-sdn
 			`NetworkPolicy.*named port`, // feature is not supported by openshift-sdn
 
-			`NetworkPolicy between server and client should support a 'default-deny-all' policy`, // uses egress feature
+			`NetworkPolicy between server and client should support a 'default-deny-all' policy`,            // uses egress feature
+			`NetworkPolicy between server and client should stop enforcing policies after they are deleted`, // uses egress feature
 		},
 	}
 

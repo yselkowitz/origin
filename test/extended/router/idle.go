@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net/http"
 	"time"
 
@@ -39,6 +41,13 @@ var _ = g.Describe("[sig-network-edge][Conformance][Area:Networking][Feature:Rou
 
 	g.Describe("The HAProxy router", func() {
 		g.It("should be able to connect to a service that is idled because a GET on the route will unidle it", func() {
+			network, err := oc.AdminConfigClient().ConfigV1().Networks().Get(context.Background(), "cluster", metav1.GetOptions{})
+			o.Expect(err).NotTo(o.HaveOccurred(), "failed to get cluster network configuration")
+			if !(network.Status.NetworkType == "OVNKubernetes" || network.Status.NetworkType == "OpenShiftSDN") {
+				g.Skip("idle feature only supported on OVNKubernetes or OpenShiftSDN")
+				return
+			}
+
 			infra, err := oc.AdminConfigClient().ConfigV1().Infrastructures().Get(context.Background(), "cluster", metav1.GetOptions{})
 			o.Expect(err).NotTo(o.HaveOccurred(), "failed to get cluster-wide infrastructure")
 			switch infra.Status.PlatformStatus.Type {
@@ -60,7 +69,8 @@ var _ = g.Describe("[sig-network-edge][Conformance][Area:Networking][Feature:Rou
 			o.Expect(err).NotTo(o.HaveOccurred(), "pods not running")
 
 			g.By("Getting a 200 status code when accessing the route")
-			hostname := getHostnameForRoute(oc, "idle-test")
+			hostname, err := getHostnameForRoute(oc, "idle-test")
+			o.Expect(err).NotTo(o.HaveOccurred())
 			err = waitHTTPGetStatus(hostname, http.StatusOK, timeout)
 			o.Expect(err).NotTo(o.HaveOccurred(), "expected status 200 from the GET request")
 
@@ -99,6 +109,10 @@ var _ = g.Describe("[sig-network-edge][Conformance][Area:Networking][Feature:Rou
 			})
 			o.Expect(err).NotTo(o.HaveOccurred(), "failed to fetch the service")
 			mustVerifyIdleAnnotationValues(annotations)
+
+			// wait for target deployment to actually scale down
+			err = waitForRunningPods(oc, 0, exutil.ParseLabelsOrDie("app=idle-test"), timeout)
+			o.Expect(err).NotTo(o.HaveOccurred())
 
 			g.By("Unidling the service by making a GET request on the route")
 			err = waitHTTPGetStatus(hostname, http.StatusOK, timeout)
@@ -195,18 +209,20 @@ func waitForRunningPods(oc *exutil.CLI, podCount int, podLabels labels.Selector,
 // and will return an error if the conditions are not met after the
 // specified timeout.
 func waitHTTPGetStatus(hostname string, statusCode int, timeout time.Duration) error {
-	client := makeHTTPClient(false, timeout)
-
+	client := makeHTTPClient(false, 30*time.Second)
 	var attempt int
+
+	url := "http://" + hostname
 
 	return wait.Poll(time.Second, timeout, func() (bool, error) {
 		attempt += 1
-		url := "http://" + hostname
 		resp, err := client.Get(url)
 		if err != nil {
 			e2e.Logf("GET#%v %q error=%v", attempt, url, err)
 			return false, nil // could be 503 if service not ready
 		}
+		defer resp.Body.Close()
+		io.Copy(ioutil.Discard, resp.Body)
 		e2e.Logf("GET#%v %q status=%v", attempt, url, resp.StatusCode)
 		return resp.StatusCode == statusCode, nil
 	})

@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/openshift/origin/pkg/monitor/monitorapi"
+
 	"github.com/onsi/ginkgo"
 	configv1 "github.com/openshift/api/config/v1"
 	configclient "github.com/openshift/client-go/config/clientset/versioned"
@@ -65,7 +67,8 @@ func (t *UpgradeTest) Setup(f *framework.Framework) {
 	ginkgo.By("creating a TCP service " + serviceName + " with type=LoadBalancer in namespace " + ns.Name)
 	tcpService, err := jig.CreateTCPService(func(s *v1.Service) {
 		s.Spec.Type = v1.ServiceTypeLoadBalancer
-		s.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeLocal
+		// ServiceExternalTrafficPolicyTypeCluster performs during disruption, Local does not
+		s.Spec.ExternalTrafficPolicy = v1.ServiceExternalTrafficPolicyTypeCluster
 		if s.Annotations == nil {
 			s.Annotations = make(map[string]string)
 		}
@@ -89,8 +92,11 @@ func (t *UpgradeTest) Setup(f *framework.Framework) {
 
 	ginkgo.By("creating RC to be part of service " + serviceName)
 	rc, err := jig.Run(func(rc *v1.ReplicationController) {
+		// ensure the pod waits long enough during update for the LB to see the newly ready pod, which
+		// must be longer than the worst load balancer above (GCP at 32s)
+		rc.Spec.MinReadySeconds = 33
 		// ensure the pod waits long enough for most LBs to take it out of rotation, which has to be
-		// longer than the LB failed health check interval
+		// longer than the LB failed health check duration + 1 cycle
 		rc.Spec.Template.Spec.Containers[0].Lifecycle = &v1.Lifecycle{
 			PreStop: &v1.Handler{
 				Exec: &v1.ExecAction{Command: []string{"sleep", "45"}},
@@ -152,7 +158,7 @@ func (t *UpgradeTest) Test(f *framework.Framework, done <-chan struct{}, upgrade
 	cancel()
 	end := time.Now()
 
-	disruption.ExpectNoDisruption(f, 0.02, end.Sub(start), m.Events(time.Time{}, time.Time{}), "Service was unreachable during disruption")
+	disruption.ExpectNoDisruption(f, 0.02, end.Sub(start), m.Intervals(time.Time{}, time.Time{}), "Service was unreachable during disruption")
 
 	// verify finalizer behavior
 	defer func() {
@@ -183,41 +189,39 @@ func startEndpointMonitoring(ctx context.Context, m *monitor.Monitor, svc *v1.Se
 		},
 	}
 
-	m.AddSampler(
-		monitor.StartSampling(ctx, m, time.Second, func(previous bool) (condition *monitor.Condition, next bool) {
-			resp, err := continuousClient.Get(url)
-			if err == nil {
-				defer resp.Body.Close()
-				body, err := ioutil.ReadAll(resp.Body)
-				if err == nil && !bytes.Contains(body, []byte("Hello")) {
-					err = fmt.Errorf("service returned success but did not contain the correct body contents: %q", string(body))
-				}
+	go monitor.NewSampler(m, time.Second, func(previous bool) (condition *monitorapi.Condition, next bool) {
+		resp, err := continuousClient.Get(url)
+		if err == nil {
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err == nil && !bytes.Contains(body, []byte("Hello")) {
+				err = fmt.Errorf("service returned success but did not contain the correct body contents: %q", string(body))
 			}
-			switch {
-			case err == nil && !previous:
-				condition = &monitor.Condition{
-					Level:   monitor.Info,
-					Locator: locateService(svc),
-					Message: "Service started responding to GET requests on reused connections",
-				}
-			case err != nil && previous:
-				framework.Logf("Service %s is unreachable on reused connections: %v", svc.Name, err)
-				r.Eventf(&v1.ObjectReference{Kind: "Service", Namespace: "kube-system", Name: "service-upgrade-test"}, nil, v1.EventTypeWarning, "Unreachable", "detected", "on reused connections")
-				condition = &monitor.Condition{
-					Level:   monitor.Error,
-					Locator: locateService(svc),
-					Message: "Service stopped responding to GET requests on reused connections",
-				}
-			case err != nil:
-				framework.Logf("Service %s is unreachable on reused connections: %v", svc.Name, err)
+		}
+		switch {
+		case err == nil && !previous:
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Info,
+				Locator: locateService(svc),
+				Message: "Service started responding to GET requests on reused connections",
 			}
-			return condition, err == nil
-		}).ConditionWhenFailing(&monitor.Condition{
-			Level:   monitor.Error,
-			Locator: locateService(svc),
-			Message: "Service is not responding to GET requests on reused connections",
-		}),
-	)
+		case err != nil && previous:
+			framework.Logf("Service %s is unreachable on reused connections: %v", svc.Name, err)
+			r.Eventf(&v1.ObjectReference{Kind: "Service", Namespace: "kube-system", Name: "service-upgrade-test"}, nil, v1.EventTypeWarning, "Unreachable", "detected", "on reused connections")
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Error,
+				Locator: locateService(svc),
+				Message: "Service stopped responding to GET requests on reused connections",
+			}
+		case err != nil:
+			framework.Logf("Service %s is unreachable on reused connections: %v", svc.Name, err)
+		}
+		return condition, err == nil
+	}).WhenFailing(ctx, &monitorapi.Condition{
+		Level:   monitorapi.Error,
+		Locator: locateService(svc),
+		Message: "Service is not responding to GET requests on reused connections",
+	})
 
 	// this client creates fresh connections and detects failure to establish connections
 	client := &http.Client{
@@ -232,41 +236,41 @@ func startEndpointMonitoring(ctx context.Context, m *monitor.Monitor, svc *v1.Se
 			DisableKeepAlives:   true,
 		},
 	}
-	m.AddSampler(
-		monitor.StartSampling(ctx, m, time.Second, func(previous bool) (condition *monitor.Condition, next bool) {
-			resp, err := client.Get(url)
-			if err == nil {
-				defer resp.Body.Close()
-				body, err := ioutil.ReadAll(resp.Body)
-				if err == nil && !bytes.Contains(body, []byte("Hello")) {
-					err = fmt.Errorf("service returned success but did not contain the correct body contents: %q", string(body))
-				}
+
+	go monitor.NewSampler(m, time.Second, func(previous bool) (condition *monitorapi.Condition, next bool) {
+		resp, err := client.Get(url)
+		if err == nil {
+			defer resp.Body.Close()
+			body, err := ioutil.ReadAll(resp.Body)
+			if err == nil && !bytes.Contains(body, []byte("Hello")) {
+				err = fmt.Errorf("service returned success but did not contain the correct body contents: %q", string(body))
 			}
-			switch {
-			case err == nil && !previous:
-				condition = &monitor.Condition{
-					Level:   monitor.Info,
-					Locator: locateService(svc),
-					Message: "Service started responding to GET requests over new connections",
-				}
-			case err != nil && previous:
-				framework.Logf("Service %s is unreachable on new connections: %v", svc.Name, err)
-				r.Eventf(&v1.ObjectReference{Kind: "Service", Namespace: "kube-system", Name: "service-upgrade-test"}, nil, v1.EventTypeWarning, "Unreachable", "detected", "on new connections")
-				condition = &monitor.Condition{
-					Level:   monitor.Error,
-					Locator: locateService(svc),
-					Message: "Service stopped responding to GET requests over new connections",
-				}
-			case err != nil:
-				framework.Logf("Service %s is unreachable on new connections: %v", svc.Name, err)
+		}
+		switch {
+		case err == nil && !previous:
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Info,
+				Locator: locateService(svc),
+				Message: "Service started responding to GET requests over new connections",
 			}
-			return condition, err == nil
-		}).ConditionWhenFailing(&monitor.Condition{
-			Level:   monitor.Error,
-			Locator: locateService(svc),
-			Message: "Service is not responding to GET requests over new connections",
-		}),
-	)
+		case err != nil && previous:
+			framework.Logf("Service %s is unreachable on new connections: %v", svc.Name, err)
+			r.Eventf(&v1.ObjectReference{Kind: "Service", Namespace: "kube-system", Name: "service-upgrade-test"}, nil, v1.EventTypeWarning, "Unreachable", "detected", "on new connections")
+			condition = &monitorapi.Condition{
+				Level:   monitorapi.Error,
+				Locator: locateService(svc),
+				Message: "Service stopped responding to GET requests over new connections",
+			}
+		case err != nil:
+			framework.Logf("Service %s is unreachable on new connections: %v", svc.Name, err)
+		}
+		return condition, err == nil
+	}).WhenFailing(ctx, &monitorapi.Condition{
+		Level:   monitorapi.Error,
+		Locator: locateService(svc),
+		Message: "Service is not responding to GET requests over new connections",
+	})
+
 	return nil
 }
 
